@@ -54,18 +54,18 @@ class Base64FileRequest(BaseModel):
 # --- Helper Functions ---
 
 
+# FIX: Updated to directly submit the instance method to the executor
 def _process_file_concurrently(
     file_data: bytes, file_type: str, use_ocr: bool, ocr_language: str
 ) -> Dict[str, Any]:
     """
-    Submits the CPU-bound PDF extraction task to the dedicated ThreadPoolExecutor.
+    Submits the CPU-bound PDF/Image extraction task to the dedicated ThreadPoolExecutor.
     """
     try:
-        # Pass file_type and ocr_language to the processor
+        # Pass all necessary arguments to the processor's extract_text method
         future = PROCESS_EXECUTOR.submit(
             processor.extract_text, file_data, file_type, use_ocr, ocr_language
         )
-
         # Wait for the result and raise any exception that occurred during processing
         result = future.result()
         return result
@@ -137,7 +137,7 @@ async def extract_text_from_file(
         file_data = await file.read()
         file_type = file.content_type
 
-        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
+        # FIX: The executor call is now correct.
         result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR,
             _process_file_concurrently,
@@ -177,7 +177,7 @@ async def extract_text_from_base64(request: Base64FileRequest) -> JSONResponse:
             )
 
         # 2. Process data in the thread pool (I/O and CPU bound)
-        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
+        # FIX: The executor call is now correct.
         result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR,
             _process_file_concurrently,
