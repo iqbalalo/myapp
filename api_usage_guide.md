@@ -1,4 +1,142 @@
-# API Key Management & Usage Guide
+---
+
+### 4. Get API Usage Statistics
+
+**Endpoint:** `GET /api/keys/usage/`
+
+**Headers:**
+```
+X-API-Key: Pass#0123456789#?
+```
+
+**Query Parameters:**
+- `api_key` (optional): Filter by specific API key
+- `email` (optional): Filter by user email
+- `limit` (optional): Maximum records to return (default: 100)
+
+**Response:**
+```json
+{
+  "success": true,
+  "filters": {
+    "api_key": null,
+    "email": "user@example.com",
+    "limit": 100
+  },
+  "summary": {
+    "total_requests": 234,
+    "unique_keys": 1,
+    "unique_users": 1,
+    "first_request": "2025-10-01T10:00:00",
+    "last_request": "2025-10-09T15:30:00"
+  },
+  "records": [
+    {
+      "id": 1543,
+      "email": "user@example.com",
+      "api_key_masked": "sk_abcdefgh...xyz12345",
+      "used": "2025-10-09T15:30:00",
+      "ip": "192.168.1.100"
+    },
+    {
+      "id": 1542,
+      "email": "user@example.com",
+      "api_key_masked": "sk_abcdefgh...xyz12345",
+      "used": "2025-10-09T15:25:00",
+      "ip": "203.0.113.45"
+    }
+  ]
+}
+```
+
+**cURL Examples:**
+
+Get all usage (last 100 records):
+```bash
+curl -X GET "http://52.196.69.248:8080/api/api/keys/usage/" \
+  -H "X-API-Key: Pass#0123456789#?"
+```
+
+Get usage for specific email (verify user activity):
+```bash
+curl -X GET "http://52.196.69.248:8080/api/api/keys/usage/?email=user@example.com&limit=50" \
+  -H "X-API-Key: Pass#0123456789#?"
+```
+
+Get usage for specific API key:
+```bash
+curl -X GET "http://52.196.69.248:8080/api/api/keys/usage/?api_key=sk_xxxxxxxxxxxxxxxxxxxxxxxxxxx&limit=50" \
+  -H "X-API-Key: Pass#0123456789#?"
+```
+
+Get usage for specific email AND API key (double verification):
+```bash
+curl -X GET "http://52.196.69.248:8080/api/api/keys/usage/?email=user@example.com&api_key=sk_xxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+  -H "X-API-Key: Pass#0123456789#?"
+```
+
+**Python Example:**
+```python
+import requests
+
+headers = {'X-API-Key': 'Pass#0123456789#?'}
+
+# Verify user activity by email
+response = requests.get(
+    'http://52.196.69.248:8080/api/api/keys/usage/',
+    headers=headers,
+    params={'email': 'user@example.com', 'limit': 100}
+)
+usage = response.json()
+
+print(f"User: {usage['filters']['email']}")
+print(f"Total Requests: {usage['summary']['total_requests']}")
+print(f"Unique Keys Used: {usage['summary']['unique_keys']}")
+print(f"Last Activity: {usage['summary']['last_request']}")
+
+# Check if user is active
+if usage['summary']['total_requests'] > 0:
+    print("✓ User is active")
+    print(f"  Recent IPs: {set([r['ip'] for r in usage['records'][:10]])}")
+else:
+    print("✗ No activity found for this user")
+```
+```
+
+---
+
+## Database Schema
+
+The API usage is logged to PostgreSQL in the `api.api_key_usage` table:
+
+```sql
+CREATE TABLE api.api_key_usage (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255),
+    api_key VARCHAR(255),
+    used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ip VARCHAR(45)
+);
+
+-- Indexes for performance
+CREATE INDEX idx_api_key_usage_api_key ON api.api_key_usage(api_key);
+CREATE INDEX idx_api_key_usage_used ON api.api_key_usage(used);
+```
+
+**Fields:**
+- `id`: Auto-generated primary key
+- `email`: Email associated with the API key
+- `api_key`: The API key used for the request
+- `used`: Timestamp when the API was called
+- `ip`: Client IP address (extracted from X-Forwarded-For, X-Real-IP, or direct connection)
+
+**Note:** If the database is not accessible, the API will skip logging but continue to work normally.
+
+---
+
+## OCR Extraction Endpoints (Requires API Key)
+
+All extraction endpoints require a valid API key in the `X-API-Key` header.# API Key Management & Usage Guide
 
 ## Setup
 

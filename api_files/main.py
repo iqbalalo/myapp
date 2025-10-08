@@ -1,5 +1,14 @@
 import asyncio
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Header,
+    Depends,
+    Request,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Union, Dict, Any, List
@@ -11,6 +20,8 @@ import secrets
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Import core processor logic
 from pdf_processor import PDFProcessor
@@ -48,6 +59,15 @@ SUPPORTED_IMAGE_TYPES = {
     "image/webp",
 }
 
+# Database configuration
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "db"),
+    "port": os.getenv("DB_PORT", "5432"),
+    "database": os.getenv("POSTGRES_DB", "postgres"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", "Pass#0123456789"),
+}
+
 
 # Request schemas
 class Base64FileRequest(BaseModel):
@@ -71,6 +91,155 @@ class DeleteAPIKeyRequest(BaseModel):
 
 
 # --- API Key Management Functions ---
+
+
+def _get_db_connection():
+    """
+    Gets a database connection.
+
+    Returns:
+        Database connection or None if connection fails
+    """
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        logging.error(f"Database connection failed: {e}")
+        return None
+
+
+def _init_api_usage_table():
+    """
+    Initializes the api_key_usage table if it doesn't exist.
+    Creates the table in the 'api' schema.
+    """
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            return False
+
+        cursor = conn.cursor()
+
+        # Create schema if it doesn't exist
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS api;")
+
+        # Create table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api.api_key_usage (
+                id SERIAL PRIMARY KEY,
+                email TEXT,
+                api_key TEXT,
+                used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ip TEXT
+            );
+        """)
+
+        # Create indexes for faster queries
+        # Index on api_key for filtering by specific key
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_api_key 
+            ON api.api_key_usage(api_key);
+        """)
+
+        # Index on email for filtering/verifying by user email
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email 
+            ON api.api_key_usage(email);
+        """)
+
+        # Index on used timestamp for time-based queries (e.g., last 7 days, ordering)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_used 
+            ON api.api_key_usage(used);
+        """)
+
+        # Composite index for combined email + date range queries
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email_used 
+            ON api.api_key_usage(email, used);
+        """)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        logging.info("API usage table initialized successfully")
+        return True
+
+    except Exception as e:
+        logging.error(f"Failed to initialize API usage table: {e}")
+        return False
+
+
+def _log_api_usage(api_key: str, ip: Optional[str] = None):
+    """
+    Logs API key usage to the database.
+
+    Args:
+        api_key: The API key used
+        ip: Optional IP address of the requester
+    """
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            logging.warning("Skipping API usage logging - database not accessible")
+            return
+
+        # Get email associated with the API key
+        email = None
+        if api_key == _get_default_api_key():
+            email = "master@system"
+        else:
+            api_keys = _load_api_keys()
+            if api_key in api_keys:
+                email = api_keys[api_key].get("email")
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO api.api_key_usage (email, api_key, used, ip)
+            VALUES (%s, %s, %s, %s);
+        """,
+            (email, api_key, datetime.now(), ip),
+        )
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        logging.debug(f"API usage logged for {email}")
+
+    except Exception as e:
+        logging.error(f"Failed to log API usage: {e}")
+        # Don't raise exception - logging failure shouldn't break the API
+
+
+def _get_client_ip(request: Request) -> Optional[str]:
+    """
+    Extracts client IP address from request.
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        IP address string or None
+    """
+    # Check for forwarded IP first (in case of proxy/nginx)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # X-Forwarded-For can contain multiple IPs, get the first one
+        return forwarded_for.split(",")[0].strip()
+
+    # Check for real IP
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
+
+    # Fall back to direct client IP
+    if request.client:
+        return request.client.host
+
+    return None
 
 
 def _get_default_api_key() -> str:
@@ -160,11 +329,14 @@ def _is_api_key_valid(api_key: str) -> bool:
     return True
 
 
-async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
+async def verify_api_key(
+    request: Request, x_api_key: str = Header(..., alias="X-API-Key")
+):
     """
-    Dependency to verify API key from header.
+    Dependency to verify API key from header and log usage.
 
     Args:
+        request: FastAPI Request object
         x_api_key: API key from X-API-Key header
 
     Raises:
@@ -172,14 +344,22 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     """
     if not _is_api_key_valid(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid or expired API key")
+
+    # Log API usage
+    client_ip = _get_client_ip(request)
+    _log_api_usage(x_api_key, client_ip)
+
     return x_api_key
 
 
-async def verify_master_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
+async def verify_master_api_key(
+    request: Request, x_api_key: str = Header(..., alias="X-API-Key")
+):
     """
-    Dependency to verify master API key for admin operations.
+    Dependency to verify master API key for admin operations and log usage.
 
     Args:
+        request: FastAPI Request object
         x_api_key: API key from X-API-Key header
 
     Raises:
@@ -189,6 +369,11 @@ async def verify_master_api_key(x_api_key: str = Header(..., alias="X-API-Key"))
         raise HTTPException(
             status_code=403, detail="Master API key required for this operation"
         )
+
+    # Log API usage
+    client_ip = _get_client_ip(request)
+    _log_api_usage(x_api_key, client_ip)
+
     return x_api_key
 
 
@@ -251,6 +436,9 @@ async def startup_event():
     _setup_temp_dir()
     logging.info("FastAPI service started and temporary directory initialized.")
 
+    # Initialize database table for API usage logging
+    _init_api_usage_table()
+
     # Log installed Tesseract languages for debugging
     try:
         import pytesseract
@@ -281,7 +469,9 @@ def shutdown_event():
 
 @app.post("/api/keys/create/")
 async def create_api_key(
-    request: CreateAPIKeyRequest, _: str = Depends(verify_master_api_key)
+    request: CreateAPIKeyRequest,
+    fastapi_request: Request,
+    _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
     """
     Creates a new API key (requires master API key).
@@ -335,7 +525,9 @@ async def create_api_key(
 
 
 @app.get("/api/keys/list/")
-async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse:
+async def list_api_keys(
+    fastapi_request: Request, _: str = Depends(verify_master_api_key)
+) -> JSONResponse:
     """
     Lists all API keys (requires master API key).
 
@@ -382,7 +574,9 @@ async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse
 
 @app.delete("/api/keys/delete/")
 async def delete_api_key(
-    request: DeleteAPIKeyRequest, _: str = Depends(verify_master_api_key)
+    request: DeleteAPIKeyRequest,
+    fastapi_request: Request,
+    _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
     """
     Deletes an API key (requires master API key).
@@ -437,11 +631,194 @@ async def delete_api_key(
         )
 
 
+@app.get("/api/keys/usage/")
+async def get_api_usage_stats(
+    fastapi_request: Request,
+    api_key: Optional[str] = None,
+    email: Optional[str] = None,
+    limit: Optional[int] = 100,
+    _: str = Depends(verify_master_api_key),
+) -> JSONResponse:
+    """
+    Gets API usage statistics (requires master API key).
+
+    Args:
+        api_key: Optional - filter by specific API key
+        email: Optional - filter by user email
+        limit: Maximum number of records to return (default: 100)
+
+    Returns:
+        API usage statistics
+    """
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database not accessible")
+
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Build query based on filters
+        if api_key and email:
+            # Filter by both api_key and email
+            cursor.execute(
+                """
+                SELECT id, email, api_key, used, ip
+                FROM api.api_key_usage
+                WHERE api_key = %s AND email = %s
+                ORDER BY used DESC
+                LIMIT %s;
+            """,
+                (api_key, email, limit),
+            )
+        elif api_key:
+            # Filter by api_key only
+            cursor.execute(
+                """
+                SELECT id, email, api_key, used, ip
+                FROM api.api_key_usage
+                WHERE api_key = %s
+                ORDER BY used DESC
+                LIMIT %s;
+            """,
+                (api_key, limit),
+            )
+        elif email:
+            # Filter by email only
+            cursor.execute(
+                """
+                SELECT id, email, api_key, used, ip
+                FROM api.api_key_usage
+                WHERE email = %s
+                ORDER BY used DESC
+                LIMIT %s;
+            """,
+                (email, limit),
+            )
+        else:
+            # Get all usage
+            cursor.execute(
+                """
+                SELECT id, email, api_key, used, ip
+                FROM api.api_key_usage
+                ORDER BY used DESC
+                LIMIT %s;
+            """,
+                (limit,),
+            )
+
+        records = cursor.fetchall()
+
+        # Get summary statistics (with same filters)
+        if api_key and email:
+            cursor.execute(
+                """
+                SELECT 
+                    COUNT(*) as total_requests,
+                    COUNT(DISTINCT api_key) as unique_keys,
+                    COUNT(DISTINCT email) as unique_users,
+                    MIN(used) as first_request,
+                    MAX(used) as last_request
+                FROM api.api_key_usage
+                WHERE api_key = %s AND email = %s;
+            """,
+                (api_key, email),
+            )
+        elif api_key:
+            cursor.execute(
+                """
+                SELECT 
+                    COUNT(*) as total_requests,
+                    COUNT(DISTINCT api_key) as unique_keys,
+                    COUNT(DISTINCT email) as unique_users,
+                    MIN(used) as first_request,
+                    MAX(used) as last_request
+                FROM api.api_key_usage
+                WHERE api_key = %s;
+            """,
+                (api_key,),
+            )
+        elif email:
+            cursor.execute(
+                """
+                SELECT 
+                    COUNT(*) as total_requests,
+                    COUNT(DISTINCT api_key) as unique_keys,
+                    COUNT(DISTINCT email) as unique_users,
+                    MIN(used) as first_request,
+                    MAX(used) as last_request
+                FROM api.api_key_usage
+                WHERE email = %s;
+            """,
+                (email,),
+            )
+        else:
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_requests,
+                    COUNT(DISTINCT api_key) as unique_keys,
+                    COUNT(DISTINCT email) as unique_users,
+                    MIN(used) as first_request,
+                    MAX(used) as last_request
+                FROM api.api_key_usage;
+            """)
+
+        summary = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        # Convert records to serializable format
+        usage_records = []
+        for record in records:
+            usage_records.append(
+                {
+                    "id": record["id"],
+                    "email": record["email"],
+                    "api_key_masked": record["api_key"][:12]
+                    + "..."
+                    + record["api_key"][-8:]
+                    if record["api_key"]
+                    else None,
+                    "used": record["used"].isoformat() if record["used"] else None,
+                    "ip": record["ip"],
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "filters": {"api_key": api_key, "email": email, "limit": limit},
+                "summary": {
+                    "total_requests": summary["total_requests"],
+                    "unique_keys": summary["unique_keys"],
+                    "unique_users": summary["unique_users"],
+                    "first_request": summary["first_request"].isoformat()
+                    if summary["first_request"]
+                    else None,
+                    "last_request": summary["last_request"].isoformat()
+                    if summary["last_request"]
+                    else None,
+                },
+                "records": usage_records,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error getting API usage stats: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get usage stats: {str(e)}"
+        )
+
+
 # --- OCR Extraction Endpoints (Protected) ---
 
 
 @app.get("/tesseract/languages/")
-async def get_tesseract_languages(_: str = Depends(verify_api_key)):
+async def get_tesseract_languages(
+    fastapi_request: Request, _: str = Depends(verify_api_key)
+):
     """Returns list of installed Tesseract languages."""
     try:
         import pytesseract
@@ -462,6 +839,7 @@ async def get_tesseract_languages(_: str = Depends(verify_api_key)):
 
 @app.post("/extract/file/")
 async def extract_text_from_file(
+    fastapi_request: Request,
     file: UploadFile = File(..., description="PDF or image file to process"),
     use_ocr: Optional[bool] = Form(
         True, description="Enable OCR fallback for image pages (PDF only)"
@@ -524,7 +902,9 @@ async def extract_text_from_file(
 
 @app.post("/extract/base64/")
 async def extract_text_from_base64(
-    request: Base64FileRequest, _: str = Depends(verify_api_key)
+    request: Base64FileRequest,
+    fastapi_request: Request,
+    _: str = Depends(verify_api_key),
 ) -> JSONResponse:
     """
     Accepts a PDF file encoded as a Base64 string and extracts text.
@@ -566,7 +946,9 @@ async def extract_text_from_base64(
 
 @app.post("/extract/image/base64/")
 async def extract_text_from_image_base64(
-    request: Base64ImageRequest, _: str = Depends(verify_api_key)
+    request: Base64ImageRequest,
+    fastapi_request: Request,
+    _: str = Depends(verify_api_key),
 ) -> JSONResponse:
     """
     Accepts an image file encoded as a Base64 string and extracts text using OCR.
@@ -612,6 +994,7 @@ async def root():
                     "create_key": "/api/keys/create/ (POST) - Requires master key",
                     "list_keys": "/api/keys/list/ (GET) - Requires master key",
                     "delete_key": "/api/keys/delete/ (DELETE) - Requires master key",
+                    "usage_stats": "/api/keys/usage/ (GET) - Requires master key",
                 },
                 "extraction": {
                     "file": "/extract/file/ (POST)",
