@@ -112,11 +112,40 @@ def _cleanup_temp_dir():
 # --- API Endpoints ---
 
 
+@app.get("/tesseract/languages/")
+async def get_tesseract_languages():
+    """Returns list of installed Tesseract languages."""
+    try:
+        import pytesseract
+
+        languages = pytesseract.get_languages(config="")
+        return JSONResponse(
+            content={
+                "installed_languages": languages,
+                "note": "Use '+' to combine languages, e.g., 'eng+ben' for English and Bengali",
+            }
+        )
+    except Exception as e:
+        logging.error(f"Error getting Tesseract languages: {e}")
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to get languages: {str(e)}"}
+        )
+
+
 @app.on_event("startup")
 async def startup_event():
     """Runs when the FastAPI application starts."""
     _setup_temp_dir()
     logging.info("FastAPI service started and temporary directory initialized.")
+
+    # Log installed Tesseract languages for debugging
+    try:
+        import pytesseract
+
+        languages = pytesseract.get_languages(config="")
+        logging.info(f"Tesseract installed languages: {languages}")
+    except Exception as e:
+        logging.error(f"Could not retrieve Tesseract languages: {e}")
 
 
 @app.on_event("shutdown")
