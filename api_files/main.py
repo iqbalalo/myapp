@@ -33,18 +33,16 @@ logging.basicConfig(
 # Initialize the PDF Processor
 processor = PDFProcessor()
 app = FastAPI(
-    title="PDF/Image OCR Text Extractor API",
-    description="Accepts PDF and image files (as multipart or base64) for text extraction. Optimized for concurrent requests.",
+    title="PDF OCR Text Extractor API",
+    description="Accepts PDF files (as multipart or base64) for hybrid PDF/OCR text extraction. Optimized for concurrent requests.",
     version="1.0.0",
 )
 
 
 # Request schema for Base64 input
 class Base64FileRequest(BaseModel):
-    # Base64 string of the file
+    # Base64 string of the PDF file
     file_base64: str
-    # ADDED: New field to specify file type for base64
-    file_type: str = "application/pdf"
     # Optional field to control OCR use
     use_ocr: Optional[bool] = True
     # ADDED: Optional field to specify Tesseract languages
@@ -54,18 +52,18 @@ class Base64FileRequest(BaseModel):
 # --- Helper Functions ---
 
 
-# FIX: Updated to directly submit the instance method to the executor
 def _process_file_concurrently(
-    file_data: bytes, file_type: str, use_ocr: bool, ocr_language: str
+    file_data: bytes, use_ocr: bool, ocr_language: str
 ) -> Dict[str, Any]:
     """
-    Submits the CPU-bound PDF/Image extraction task to the dedicated ThreadPoolExecutor.
+    Submits the CPU-bound PDF extraction task to the dedicated ThreadPoolExecutor.
     """
     try:
-        # Pass all necessary arguments to the processor's extract_text method
+        # Pass ocr_language to the processor
         future = PROCESS_EXECUTOR.submit(
-            processor.extract_text, file_data, file_type, use_ocr, ocr_language
+            processor.extract_text, file_data, use_ocr, ocr_language
         )
+
         # Wait for the result and raise any exception that occurred during processing
         result = future.result()
         return result
@@ -112,7 +110,7 @@ def shutdown_event():
 
 @app.post("/extract/file/")
 async def extract_text_from_file(
-    file: UploadFile = File(..., description="PDF or image file to process"),
+    file: UploadFile = File(..., description="PDF file to process"),
     use_ocr: Optional[bool] = Form(
         True, description="Enable OCR fallback for image pages"
     ),
@@ -122,27 +120,23 @@ async def extract_text_from_file(
     ),
 ) -> JSONResponse:
     """
-    Accepts a PDF or image file via multipart/form-data and extracts text.
+    Accepts a PDF file via multipart/form-data and extracts text.
     """
-    # UPDATED: Allow multiple content types
-    allowed_types = ["application/pdf", "image/jpeg", "image/png", "image/tiff"]
-    if file.content_type not in allowed_types:
+    if file.content_type != "application/pdf":
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type: {file.content_type}. Supported types: {', '.join(allowed_types)}",
+            detail=f"Invalid file type: {file.content_type}. Only application/pdf is supported.",
         )
 
     try:
         # Read file data directly into memory (bytes)
         file_data = await file.read()
-        file_type = file.content_type
 
-        # FIX: The executor call is now correct.
+        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
         result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR,
             _process_file_concurrently,
             file_data,
-            file_type,  # NEW: Pass the file type
             use_ocr,
             ocr_language,
         )
@@ -162,27 +156,26 @@ async def extract_text_from_file(
 @app.post("/extract/base64/")
 async def extract_text_from_base64(request: Base64FileRequest) -> JSONResponse:
     """
-    Accepts a PDF or image file encoded as a Base64 string and extracts text.
+    Accepts a PDF file encoded as a Base64 string and extracts text.
     """
+    temp_file_path = None
     try:
         # 1. Convert Base64 to binary data
         file_data = base64.b64decode(request.file_base64)
-        file_type = request.file_type
 
-        # Basic check to ensure it's PDF or image data
-        if not (file_data.startswith(b"%PDF") or file_type.startswith("image/")):
+        # Basic check to ensure it's PDF data
+        if not file_data.startswith(b"%PDF"):
             raise HTTPException(
                 status_code=400,
-                detail="Base64 string does not decode to valid PDF or image data, or file_type is incorrect.",
+                detail="Base64 string does not decode to valid PDF data.",
             )
 
         # 2. Process data in the thread pool (I/O and CPU bound)
-        # FIX: The executor call is now correct.
+        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
         result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR,
             _process_file_concurrently,
             file_data,
-            file_type,  # NEW: Pass the file type
             request.use_ocr,
             request.ocr_language,
         )
