@@ -45,18 +45,24 @@ class Base64FileRequest(BaseModel):
     file_base64: str
     # Optional field to control OCR use
     use_ocr: Optional[bool] = True
+    # ADDED: Optional field to specify Tesseract languages
+    ocr_language: Optional[str] = "eng+jpn"
 
 
 # --- Helper Functions ---
 
 
-def _process_file_concurrently(file_data: bytes, use_ocr: bool) -> Dict[str, Any]:
+def _process_file_concurrently(
+    file_data: bytes, use_ocr: bool, ocr_language: str
+) -> Dict[str, Any]:
     """
     Submits the CPU-bound PDF extraction task to the dedicated ThreadPoolExecutor.
     """
     try:
-        # Submit the extraction task to the dedicated process executor
-        future = PROCESS_EXECUTOR.submit(processor.extract_text, file_data, use_ocr)
+        # Pass ocr_language to the processor
+        future = PROCESS_EXECUTOR.submit(
+            processor.extract_text, file_data, use_ocr, ocr_language
+        )
 
         # Wait for the result and raise any exception that occurred during processing
         result = future.result()
@@ -108,6 +114,10 @@ async def extract_text_from_file(
     use_ocr: Optional[bool] = Form(
         True, description="Enable OCR fallback for image pages"
     ),
+    # ADDED: New parameter with default value excluding Bengali
+    ocr_language: Optional[str] = Form(
+        "eng+jpn", description="Tesseract language code (e.g., 'eng+jpn', 'eng+ben')"
+    ),
 ) -> JSONResponse:
     """
     Accepts a PDF file via multipart/form-data and extracts text.
@@ -124,7 +134,11 @@ async def extract_text_from_file(
 
         # FIX: Replace app.loop with explicit asyncio.get_event_loop()
         result = await asyncio.get_event_loop().run_in_executor(
-            PROCESS_EXECUTOR, _process_file_concurrently, file_data, use_ocr
+            PROCESS_EXECUTOR,
+            _process_file_concurrently,
+            file_data,
+            use_ocr,
+            ocr_language,
         )
 
         if result.get("error"):
@@ -159,7 +173,11 @@ async def extract_text_from_base64(request: Base64FileRequest) -> JSONResponse:
         # 2. Process data in the thread pool (I/O and CPU bound)
         # FIX: Replace app.loop with explicit asyncio.get_event_loop()
         result = await asyncio.get_event_loop().run_in_executor(
-            PROCESS_EXECUTOR, _process_file_concurrently, file_data, request.use_ocr
+            PROCESS_EXECUTOR,
+            _process_file_concurrently,
+            file_data,
+            request.use_ocr,
+            request.ocr_language,
         )
 
         if result.get("error"):

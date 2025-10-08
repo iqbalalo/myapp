@@ -16,7 +16,7 @@ import threading
 
 # Configuration
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-TESSERACT_LANGUAGES = "eng+jpn+ben"  # English, Japanese, and Bengali
+# Removed TESSERACT_LANGUAGES global constant, as it is now passed dynamically.
 
 logging.getLogger().setLevel(logging.ERROR)
 # Lock for concurrent access to mutable resources (though mostly managed by futures here)
@@ -96,7 +96,9 @@ class PDFProcessor:
                     pages_data.append((page_num, "", False))
         return pages_data
 
-    def _process_single_page_ocr(self, image, page_num) -> Tuple[int, str]:
+    def _process_single_page_ocr(
+        self, image, page_num, ocr_language: str
+    ) -> Tuple[int, str]:
         """Processes a single page with OCR, optimized for speed and quality."""
         try:
             # Optimization: Convert to grayscale
@@ -108,12 +110,13 @@ class PDFProcessor:
             if width > 3000 or height > 3000:
                 image = image.resize((2000, 2000), Image.Resampling.LANCZOS)
 
-            # Optimized Tesseract config: PSM 1 (sparse text, best fit) or PSM 3 (default)
-            # Using PSM 3, which is the default for a fully structured page.
+            # Optimized Tesseract config: PSM 3 is the default for a fully structured page.
             custom_config = r"--oem 1 --psm 3"
 
             extracted_text = pytesseract.image_to_string(
-                image, config=custom_config, lang=TESSERACT_LANGUAGES
+                image,
+                config=custom_config,
+                lang=ocr_language,  # USED DYNAMIC LANGUAGE CODE
             )
 
             fixed_text = self._fix_japanese_spacing(extracted_text)
@@ -127,7 +130,7 @@ class PDFProcessor:
             return page_num, f"[OCR Error: {type(e).__name__} - {str(e)}]"
 
     def _extract_text_with_ocr_memory(
-        self, pdf_data: bytes, page_numbers: List[int]
+        self, pdf_data: bytes, page_numbers: List[int], ocr_language: str
     ) -> Dict[int, str]:
         """Performs OCR on specific PDF pages in parallel using pdf2image and pytesseract."""
         if not page_numbers:
@@ -167,7 +170,10 @@ class PDFProcessor:
             ) as executor:
                 future_to_page = {
                     executor.submit(
-                        self._process_single_page_ocr, image, page_num
+                        self._process_single_page_ocr,
+                        image,
+                        page_num,
+                        ocr_language,  # PASSED LANGUAGE CODE
                     ): page_num
                     for image, page_num in page_images
                 }
@@ -191,7 +197,9 @@ class PDFProcessor:
         except Exception as e:
             raise Exception(f"Error in OCR processing: {e}")
 
-    def extract_text(self, pdf_data: bytes, use_ocr: bool = True) -> Dict[str, Any]:
+    def extract_text(
+        self, pdf_data: bytes, use_ocr: bool = True, ocr_language: str = "eng+jpn"
+    ) -> Dict[str, Any]:
         """
         Main entry point for hybrid text extraction.
         Prioritizes PDF text and falls back to OCR for image-only pages.
@@ -230,7 +238,9 @@ class PDFProcessor:
 
             # Step 3: Process pages with OCR if needed
             if ocr_pages and use_ocr:
-                ocr_results = self._extract_text_with_ocr_memory(pdf_data, ocr_pages)
+                ocr_results = self._extract_text_with_ocr_memory(
+                    pdf_data, ocr_pages, ocr_language
+                )  # PASSED LANGUAGE CODE
 
                 # Update results with OCR text
                 for i, (page_num, text, method) in enumerate(final_results):
