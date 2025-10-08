@@ -1,3 +1,4 @@
+import asyncio  # ADDED: Import asyncio for loop access
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -121,8 +122,8 @@ async def extract_text_from_file(
         # Read file data directly into memory (bytes)
         file_data = await file.read()
 
-        # Process data in the thread pool to avoid blocking the main event loop
-        result = await app.loop.run_in_executor(
+        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
+        result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR, _process_file_concurrently, file_data, use_ocr
         )
 
@@ -156,7 +157,8 @@ async def extract_text_from_base64(request: Base64FileRequest) -> JSONResponse:
             )
 
         # 2. Process data in the thread pool (I/O and CPU bound)
-        result = await app.loop.run_in_executor(
+        # FIX: Replace app.loop with explicit asyncio.get_event_loop()
+        result = await asyncio.get_event_loop().run_in_executor(
             PROCESS_EXECUTOR, _process_file_concurrently, file_data, request.use_ocr
         )
 
