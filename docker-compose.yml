@@ -1,0 +1,70 @@
+# This file defines three services: PostgreSQL (db), Elasticsearch (es), and Nginx (nginx).
+
+services:
+  db:
+    image: postgres:latest
+    container_name: postgres_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=Pass#0123456789
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    container_name: elasticsearch
+    restart: unless-stopped
+    # Environment variables set the node type and the elastic user password
+    environment:
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=Pass#0123456789
+      # This setting is required for versions 7.x onwards for production use, but we set it here for completeness
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" 
+    volumes:
+      # Use a named volume for persistent storage of Elasticsearch data
+      - es_data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    # IMPORTANT: The internal port 9200 is NOT exposed to the host to force access through Nginx on 8080.
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: api_service
+    restart: always
+    volumes:
+      - ./api_files:/app/
+    ports:
+      # Host Port:8081 -> Container Port:8000
+      - "8081:8000"
+    depends_on:
+      - db
+      - es
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    restart: unless-stopped
+    # Maps the local nginx.conf to the container's configuration
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    # Maps the container's port 80 to the host's port 8080 for HTTP access
+    ports:
+      - "8080:80"
+    # Ensures Nginx starts after the dependent services
+    depends_on:
+      - db
+      - es
+      - api
+
+# Define the named volumes for data persistence
+volumes:
+  postgres_data:
+  es_data:

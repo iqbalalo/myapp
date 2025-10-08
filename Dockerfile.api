@@ -1,0 +1,42 @@
+# Use the Python 3.11 slim image
+FROM python:3.11-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Install system-level dependencies for Tesseract, Poppler (for pdf2image), and other core libraries
+RUN apt-get clean && apt-get update -o APT::Update::Timeout="120" && \
+    apt-get install -y --fix-missing --no-install-recommends \
+    # Tesseract engine and language packs (English, Japanese, Bengali)
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-jpn \
+    tesseract-ocr-ben \
+    # Poppler utilities (essential for pdf2image)
+    poppler-utils \
+    libpoppler-cpp-dev \
+    # Image library dependencies (for Pillow)
+    libjpeg-dev \
+    zlib1g-dev \
+    libpng-dev \
+    libwebp-dev \
+    libtiff-dev \
+    libfreetype6 \
+    # Libmagic (file type detection)
+    libmagic1=1:5.44-3 \
+    libmagic-mgc=1:5.44-3 \
+    # Other utility libs
+    libffi-dev \
+    portaudio19-dev \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements file and install Python packages
+COPY api_files/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Expose the port the app runs on
+EXPOSE 8000
+
+# Command to run the application using uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
