@@ -37,7 +37,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: api_service
+    container_name: myapi
     restart: always
     volumes:
       - ./api_files:/app/
