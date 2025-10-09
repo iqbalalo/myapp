@@ -201,7 +201,7 @@ def _log_api_usage(
         cursor.execute(
             """
             INSERT INTO api.api_key_usage (email, api_key, api_endpoint, used, ip)
-            VALUES (%s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s);
         """,
             (email, api_key, api_endpoint, datetime.now(), ip),
         )
