@@ -467,7 +467,7 @@ def shutdown_event():
 # --- API Key Management Endpoints ---
 
 
-@app.post("/api/keys/create/")
+@app.post("/api-keys/create/")
 async def create_api_key(
     request: CreateAPIKeyRequest,
     fastapi_request: Request,
@@ -524,7 +524,7 @@ async def create_api_key(
         )
 
 
-@app.get("/api/keys/list/")
+@app.get("/api-keys/list/")
 async def list_api_keys(
     fastapi_request: Request, _: str = Depends(verify_master_api_key)
 ) -> JSONResponse:
@@ -572,7 +572,7 @@ async def list_api_keys(
         )
 
 
-@app.delete("/api/keys/delete/")
+@app.delete("/api-keys/delete/")
 async def delete_api_key(
     request: DeleteAPIKeyRequest,
     fastapi_request: Request,
@@ -631,7 +631,7 @@ async def delete_api_key(
         )
 
 
-@app.get("/api/keys/usage/")
+@app.get("/api-keys/usage/")
 async def get_api_usage_stats(
     fastapi_request: Request,
     api_key: Optional[str] = None,
@@ -991,10 +991,10 @@ async def root():
             "authentication": "All endpoints require X-API-Key header",
             "endpoints": {
                 "admin": {
-                    "create_key": "/api/keys/create/ (POST) - Requires master key",
-                    "list_keys": "/api/keys/list/ (GET) - Requires master key",
-                    "delete_key": "/api/keys/delete/ (DELETE) - Requires master key",
-                    "usage_stats": "/api/keys/usage/ (GET) - Requires master key",
+                    "create_key": "/api-keys/create/ (POST) - Requires master key",
+                    "list_keys": "/api-keys/list/ (GET) - Requires master key",
+                    "delete_key": "/api-keys/delete/ (DELETE) - Requires master key",
+                    "usage_stats": "/api-keys/usage/ (GET) - Requires master key",
                 },
                 "extraction": {
                     "file": "/extract/file/ (POST)",
