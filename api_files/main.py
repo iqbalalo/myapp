@@ -129,6 +129,7 @@ def _init_api_usage_table():
                 id SERIAL PRIMARY KEY,
                 email TEXT,
                 api_key TEXT,
+                api_endpoint TEXT,
                 used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 ip TEXT
             );
@@ -171,7 +172,9 @@ def _init_api_usage_table():
         return False
 
 
-def _log_api_usage(api_key: str, ip: Optional[str] = None):
+def _log_api_usage(
+    api_key: str, api_endpoint: Optional[str] = None, ip: Optional[str] = None
+):
     """
     Logs API key usage to the database.
 
@@ -197,10 +200,10 @@ def _log_api_usage(api_key: str, ip: Optional[str] = None):
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO api.api_key_usage (email, api_key, used, ip)
+            INSERT INTO api.api_key_usage (email, api_key, api_endpoint, used, ip)
             VALUES (%s, %s, %s, %s);
         """,
-            (email, api_key, datetime.now(), ip),
+            (email, api_key, api_endpoint, datetime.now(), ip),
         )
 
         conn.commit()
@@ -342,12 +345,15 @@ async def verify_api_key(
     Raises:
         HTTPException: If API key is invalid or expired
     """
+    # Get the endpoint path
+    endpoint_path = request.url.path
+
     if not _is_api_key_valid(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid or expired API key")
 
     # Log API usage
     client_ip = _get_client_ip(request)
-    _log_api_usage(x_api_key, client_ip)
+    _log_api_usage(x_api_key, endpoint_path, client_ip)
 
     return x_api_key
 
@@ -365,6 +371,9 @@ async def verify_master_api_key(
     Raises:
         HTTPException: If not the master API key
     """
+    # Get the endpoint path
+    endpoint_path = request.url.path
+
     if x_api_key != _get_default_api_key():
         raise HTTPException(
             status_code=403, detail="Master API key required for this operation"
@@ -372,7 +381,7 @@ async def verify_master_api_key(
 
     # Log API usage
     client_ip = _get_client_ip(request)
-    _log_api_usage(x_api_key, client_ip)
+    _log_api_usage(x_api_key, endpoint_path, client_ip)
 
     return x_api_key
 
