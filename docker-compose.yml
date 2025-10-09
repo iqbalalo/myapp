@@ -51,7 +51,7 @@ services:
     volumes:
       - ./api_files:/app/
       # Mount api-keys.json for persistence
-      - ./api_files/api-keys.json:/app/api-keys.json
+      # - ./api_files/api-keys.json:/app/api-keys.json
     ports:
       - "8081:8000"
     depends_on:

@@ -30,7 +30,8 @@ from image_processor import ImageProcessor
 # Configuration
 PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 TEMP_DIR_ROOT = "/tmp/api_uploads"
-API_KEYS_FILE = "api-keys.json"
+# The API_KEYS_FILE constant is now obsolete as keys are stored in the DB
+# API_KEYS_FILE = "api-keys.json"
 
 # Setup logging
 logging.basicConfig(
@@ -108,10 +109,10 @@ def _get_db_connection():
         return None
 
 
-def _init_api_usage_table():
+def _init_db_tables():
     """
-    Initializes the api_key_usage table if it doesn't exist.
-    Creates the table in the 'api' schema.
+    Initializes the api_key_usage and api_keys tables if they don't exist.
+    Creates tables in the 'api' schema.
     """
     try:
         conn = _get_db_connection()
@@ -123,7 +124,7 @@ def _init_api_usage_table():
         # Create schema if it doesn't exist
         cursor.execute("CREATE SCHEMA IF NOT EXISTS api;")
 
-        # Create table if it doesn't exist
+        # Create api_key_usage table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS api.api_key_usage (
                 id SERIAL PRIMARY KEY,
@@ -135,41 +136,66 @@ def _init_api_usage_table():
             );
         """)
 
-        # Create indexes for faster queries
-        # Index on api_key for filtering by specific key
+        # Create api_keys table
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_api_key_usage_api_key 
+            CREATE TABLE IF NOT EXISTS api.api_keys (
+                id SERIAL PRIMARY KEY,
+                api_key TEXT UNIQUE NOT NULL,
+                email TEXT,
+                expires TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Create indexes for faster queries on both tables
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_api_key
             ON api.api_key_usage(api_key);
-        """)
-
-        # Index on email for filtering/verifying by user email
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email 
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email
             ON api.api_key_usage(email);
-        """)
-
-        # Index on used timestamp for time-based queries (e.g., last 7 days, ordering)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_api_key_usage_used 
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_used
             ON api.api_key_usage(used);
-        """)
-
-        # Composite index for combined email + date range queries
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email_used 
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_email_used
             ON api.api_key_usage(email, used);
+            CREATE INDEX IF NOT EXISTS idx_api_keys_api_key
+            ON api.api_keys(api_key);
         """)
 
         conn.commit()
         cursor.close()
         conn.close()
 
-        logging.info("API usage table initialized successfully")
+        logging.info("Database tables initialized successfully.")
         return True
 
     except Exception as e:
-        logging.error(f"Failed to initialize API usage table: {e}")
+        logging.error(f"Failed to initialize database tables: {e}")
         return False
+
+
+def _load_api_keys() -> Dict[str, Any]:
+    """Loads API keys from the database."""
+    conn = _get_db_connection()
+    if not conn:
+        return {}
+
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT api_key, email, expires, created_at FROM api.api_keys;")
+
+    api_keys = {}
+    for row in cursor.fetchall():
+        api_keys[row["api_key"]] = {
+            "email": row["email"],
+            "expires": row["expires"].isoformat() if row["expires"] else None,
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "expires_display": "Never"
+            if row["expires"] is None
+            else row["expires"].isoformat(),
+        }
+
+    cursor.close()
+    conn.close()
+    return api_keys
 
 
 def _log_api_usage(
@@ -180,6 +206,7 @@ def _log_api_usage(
 
     Args:
         api_key: The API key used
+        api_endpoint: The API endpoint that was called
         ip: Optional IP address of the requester
     """
     try:
@@ -214,7 +241,6 @@ def _log_api_usage(
 
     except Exception as e:
         logging.error(f"Failed to log API usage: {e}")
-        # Don't raise exception - logging failure shouldn't break the API
 
 
 def _get_client_ip(request: Request) -> Optional[str]:
@@ -251,36 +277,12 @@ def _get_default_api_key() -> str:
     return default_key
 
 
-def _load_api_keys() -> Dict[str, Any]:
-    """Loads API keys from JSON file."""
-    if not os.path.exists(API_KEYS_FILE):
-        return {}
-
-    try:
-        with open(API_KEYS_FILE, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        logging.error(f"Error loading API keys: {e}")
-        return {}
-
-
-def _save_api_keys(api_keys: Dict[str, Any]) -> bool:
-    """Saves API keys to JSON file."""
-    try:
-        with open(API_KEYS_FILE, "w") as f:
-            json.dump(api_keys, f, indent=4)
-        return True
-    except Exception as e:
-        logging.error(f"Error saving API keys: {e}")
-        return False
-
-
 def _generate_api_key() -> str:
     """Generates a secure random API key."""
     return f"sk_{secrets.token_urlsafe(32)}"
 
 
-def _calculate_expiry_date(expires: str) -> Optional[str]:
+def _calculate_expiry_date(expires: str) -> Optional[datetime]:
     """
     Calculates expiry date based on input.
 
@@ -288,7 +290,7 @@ def _calculate_expiry_date(expires: str) -> Optional[str]:
         expires: "never" or number of days as string
 
     Returns:
-        ISO format date string or None for never
+        datetime object or None for never
     """
     if expires.lower() == "never":
         return None
@@ -296,7 +298,7 @@ def _calculate_expiry_date(expires: str) -> Optional[str]:
     try:
         days = int(expires)
         expiry_date = datetime.now() + timedelta(days=days)
-        return expiry_date.isoformat()
+        return expiry_date
     except ValueError:
         raise ValueError("Expires must be 'never' or a number of days")
 
@@ -315,18 +317,25 @@ def _is_api_key_valid(api_key: str) -> bool:
     if api_key == _get_default_api_key():
         return True
 
-    # Check in stored keys
-    api_keys = _load_api_keys()
-
-    if api_key not in api_keys:
+    conn = _get_db_connection()
+    if not conn:
+        logging.error("Failed to validate API key: Database connection failed.")
         return False
 
-    key_info = api_keys[api_key]
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(
+        "SELECT email, expires FROM api.api_keys WHERE api_key = %s;", (api_key,)
+    )
+    key_info = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not key_info:
+        return False
 
     # Check if expired
     if key_info.get("expires"):
-        expiry_date = datetime.fromisoformat(key_info["expires"])
-        if datetime.now() > expiry_date:
+        if datetime.now() > key_info["expires"]:
             return False
 
     return True
@@ -446,7 +455,7 @@ async def startup_event():
     logging.info("FastAPI service started and temporary directory initialized.")
 
     # Initialize database table for API usage logging
-    _init_api_usage_table()
+    _init_db_tables()
 
     # Log installed Tesseract languages for debugging
     try:
@@ -479,7 +488,6 @@ def shutdown_event():
 @app.post("/api-keys/create/")
 async def create_api_key(
     request: CreateAPIKeyRequest,
-    fastapi_request: Request,
     _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
     """
@@ -492,38 +500,46 @@ async def create_api_key(
         New API key details
     """
     try:
-        # Load existing keys
-        api_keys = _load_api_keys()
-
         # Generate new key
         new_key = _generate_api_key()
 
         # Calculate expiry
-        expiry_date = _calculate_expiry_date(request.expires)
+        expiry_date_dt = _calculate_expiry_date(request.expires)
 
-        # Create key entry
-        api_keys[new_key] = {
-            "email": request.email,
-            "created_at": datetime.now().isoformat(),
-            "expires": expiry_date,
-            "expires_display": "Never" if expiry_date is None else expiry_date,
-        }
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database not accessible")
 
-        # Save to file
-        if not _save_api_keys(api_keys):
-            raise HTTPException(status_code=500, detail="Failed to save API key")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO api.api_keys (api_key, email, expires)
+            VALUES (%s, %s, %s)
+            RETURNING created_at;
+        """,
+            (new_key, request.email, expiry_date_dt),
+        )
+        created_at = cursor.fetchone()[0]
+
+        conn.commit()
+        cursor.close()
+        conn.close()
 
         return JSONResponse(
             content={
                 "success": True,
                 "api_key": new_key,
                 "email": request.email,
-                "created_at": api_keys[new_key]["created_at"],
-                "expires": api_keys[new_key]["expires_display"],
+                "created_at": created_at.isoformat(),
+                "expires": expiry_date_dt.isoformat() if expiry_date_dt else "Never",
                 "message": "API key created successfully. Store this key securely - it won't be shown again.",
             }
         )
 
+    except psycopg2.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409, detail="API key already exists, please try again."
+        )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -534,9 +550,7 @@ async def create_api_key(
 
 
 @app.get("/api-keys/list/")
-async def list_api_keys(
-    fastapi_request: Request, _: str = Depends(verify_master_api_key)
-) -> JSONResponse:
+async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse:
     """
     Lists all API keys (requires master API key).
 
@@ -544,24 +558,36 @@ async def list_api_keys(
         List of all API keys with their details (keys are masked)
     """
     try:
-        api_keys = _load_api_keys()
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database not accessible")
 
-        # Mask API keys for security
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT api_key, email, created_at, expires FROM api.api_keys;")
+        db_keys = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
         masked_keys = []
-        for key, info in api_keys.items():
-            # Check if expired
+        for key_info in db_keys:
             is_expired = False
-            if info.get("expires"):
-                expiry_date = datetime.fromisoformat(info["expires"])
-                is_expired = datetime.now() > expiry_date
+            if key_info.get("expires"):
+                is_expired = datetime.now() > key_info["expires"]
 
             masked_keys.append(
                 {
-                    "api_key_masked": key[:12] + "..." + key[-8:],
-                    "api_key_full": key,  # Include full key for admin purposes
-                    "email": info.get("email"),
-                    "created_at": info.get("created_at"),
-                    "expires": info.get("expires_display", info.get("expires")),
+                    "api_key_masked": key_info["api_key"][:12]
+                    + "..."
+                    + key_info["api_key"][-8:],
+                    "api_key_full": key_info["api_key"],
+                    "email": key_info["email"],
+                    "created_at": key_info["created_at"].isoformat()
+                    if key_info["created_at"]
+                    else None,
+                    "expires": key_info["expires"].isoformat()
+                    if key_info["expires"]
+                    else "Never",
                     "status": "Expired" if is_expired else "Active",
                 }
             )
@@ -584,7 +610,6 @@ async def list_api_keys(
 @app.delete("/api-keys/delete/")
 async def delete_api_key(
     request: DeleteAPIKeyRequest,
-    fastapi_request: Request,
     _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
     """
@@ -603,30 +628,40 @@ async def delete_api_key(
                 status_code=400, detail="Cannot delete the master API key"
             )
 
-        # Load existing keys
-        api_keys = _load_api_keys()
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database not accessible")
 
-        # Check if key exists
-        if request.api_key not in api_keys:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Check if key exists and get its info before deletion
+        cursor.execute(
+            "SELECT email, created_at FROM api.api_keys WHERE api_key = %s;",
+            (request.api_key,),
+        )
+        key_info = cursor.fetchone()
+
+        if not key_info:
             raise HTTPException(status_code=404, detail="API key not found")
 
-        # Get key info before deletion
-        key_info = api_keys[request.api_key]
+        # Delete the key
+        cursor.execute(
+            "DELETE FROM api.api_keys WHERE api_key = %s;", (request.api_key,)
+        )
+        conn.commit()
 
-        # Delete key
-        del api_keys[request.api_key]
-
-        # Save updated keys
-        if not _save_api_keys(api_keys):
-            raise HTTPException(status_code=500, detail="Failed to save changes")
+        cursor.close()
+        conn.close()
 
         return JSONResponse(
             content={
                 "success": True,
                 "message": "API key deleted successfully",
                 "deleted_key": {
-                    "email": key_info.get("email"),
-                    "created_at": key_info.get("created_at"),
+                    "email": key_info["email"],
+                    "created_at": key_info["created_at"].isoformat()
+                    if key_info["created_at"]
+                    else None,
                 },
             }
         )
@@ -825,9 +860,7 @@ async def get_api_usage_stats(
 
 
 @app.get("/tesseract/languages/")
-async def get_tesseract_languages(
-    fastapi_request: Request, _: str = Depends(verify_api_key)
-):
+async def get_tesseract_languages(_: str = Depends(verify_api_key)):
     """Returns list of installed Tesseract languages."""
     try:
         import pytesseract
@@ -884,7 +917,7 @@ async def extract_text_from_file(
         if is_pdf:
             result = await asyncio.get_event_loop().run_in_executor(
                 PROCESS_EXECUTOR,
-                _process_pdf_concurrently,
+                pdf_processor.extract_text,
                 file_data,
                 use_ocr,
                 ocr_language,
@@ -912,7 +945,6 @@ async def extract_text_from_file(
 @app.post("/extract/base64/")
 async def extract_text_from_base64(
     request: Base64FileRequest,
-    fastapi_request: Request,
     _: str = Depends(verify_api_key),
 ) -> JSONResponse:
     """
@@ -956,7 +988,6 @@ async def extract_text_from_base64(
 @app.post("/extract/image/base64/")
 async def extract_text_from_image_base64(
     request: Base64ImageRequest,
-    fastapi_request: Request,
     _: str = Depends(verify_api_key),
 ) -> JSONResponse:
     """
