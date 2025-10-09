@@ -279,7 +279,7 @@ def _get_default_api_key() -> str:
 
 def _generate_api_key() -> str:
     """Generates a secure random API key."""
-    return f"sk_{secrets.token_urlsafe(32)}"
+    return f"aa_{secrets.token_urlsafe(32)}"
 
 
 def _calculate_expiry_date(expires: str) -> Optional[datetime]:
