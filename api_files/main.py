@@ -873,22 +873,18 @@ async def split_pdf_from_file(
     pages_per_split: int = Form(
         ..., description="Number of pages per split file", ge=1
     ),
-    output: str = Form("json", description="Output format: 'json', 'zip', or 'files'"),
     _: str = Depends(verify_api_key),
-):
+) -> JSONResponse:
     """
     Splits a PDF file into multiple smaller PDF files.
+    Returns JSON with base64-encoded PDF files.
 
     Args:
         file: PDF file to split
         pages_per_split: Number of pages per split file (must be >= 1)
-        output: Output format:
-            - 'json': Returns JSON with base64-encoded files (default)
-            - 'zip': Returns ZIP archive containing all files
-            - 'files': Returns first split file (use with file_index param for others)
 
     Returns:
-        JSON, ZIP file, or individual PDF based on output parameter
+        JSON with base64-encoded split PDF files and metadata
     """
     content_type = file.content_type.lower()
 
@@ -897,13 +893,6 @@ async def split_pdf_from_file(
         raise HTTPException(
             status_code=400,
             detail=f"Invalid file type: {content_type}. Only PDF files are supported.",
-        )
-
-    # Validate output parameter
-    if output.lower() not in ["zip", "json", "files"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid output format. Must be 'zip', 'json', or 'files'.",
         )
 
     try:
@@ -926,96 +915,29 @@ async def split_pdf_from_file(
         if not result.get("success"):
             raise HTTPException(status_code=500, detail="PDF split failed")
 
-        # Return based on output format
-        if output.lower() == "zip":
-            # Create ZIP file in memory
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for file_info in result["files"]:
-                    zip_file.writestr(file_info["filename"], file_info["file_data"])
-
-            zip_buffer.seek(0)
-
-            # Get base filename for ZIP
-            base_filename = (
-                original_filename.rsplit(".", 1)[0]
-                if "." in original_filename
-                else original_filename
-            )
-
-            return StreamingResponse(
-                zip_buffer,
-                media_type="application/zip",
-                headers={
-                    "Content-Disposition": f"attachment; filename={base_filename}_splits.zip",
-                    "X-Total-Pages": str(result["total_pages"]),
-                    "X-Total-Splits": str(result["total_splits"]),
-                },
-            )
-
-        elif output.lower() == "files":
-            # Return individual files as multipart response
-            # NOTE: This returns ALL files in a single multipart response
-            from fastapi.responses import Response
-            import uuid
-
-            boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
-
-            # Build multipart response
-            parts = []
-            for file_info in result["files"]:
-                part = (
-                    (
-                        f"--{boundary}\r\n"
-                        f'Content-Disposition: form-data; name="file"; filename="{file_info["filename"]}"\r\n'
-                        f"Content-Type: application/pdf\r\n"
-                        f"X-Page-Range: {file_info['pages']}\r\n"
-                        f"X-Page-Count: {file_info['page_count']}\r\n"
-                        f"\r\n"
-                    ).encode("utf-8")
-                    + file_info["file_data"]
-                    + b"\r\n"
-                )
-                parts.append(part)
-
-            # Final boundary
-            parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-
-            multipart_body = b"".join(parts)
-
-            return Response(
-                content=multipart_body,
-                media_type=f"multipart/form-data; boundary={boundary}",
-                headers={
-                    "X-Total-Pages": str(result["total_pages"]),
-                    "X-Total-Splits": str(result["total_splits"]),
-                },
-            )
-
-        else:  # output == "json"
-            # Convert file data to base64 for JSON response
-            files_with_base64 = []
-            for file_info in result["files"]:
-                files_with_base64.append(
-                    {
-                        "filename": file_info["filename"],
-                        "file_base64": base64.b64encode(file_info["file_data"]).decode(
-                            "utf-8"
-                        ),
-                        "pages": file_info["pages"],
-                        "page_count": file_info["page_count"],
-                        "size_bytes": file_info["size_bytes"],
-                    }
-                )
-
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "total_pages": result["total_pages"],
-                    "total_splits": result["total_splits"],
-                    "files": files_with_base64,
+        # Convert file data to base64 for JSON response
+        files_with_base64 = []
+        for file_info in result["files"]:
+            files_with_base64.append(
+                {
+                    "filename": file_info["filename"],
+                    "file_base64": base64.b64encode(file_info["file_data"]).decode(
+                        "utf-8"
+                    ),
+                    "pages": file_info["pages"],
+                    "page_count": file_info["page_count"],
+                    "size_bytes": file_info["size_bytes"],
                 }
             )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "total_pages": result["total_pages"],
+                "total_splits": result["total_splits"],
+                "files": files_with_base64,
+            }
+        )
 
     except HTTPException:
         raise
@@ -1128,7 +1050,7 @@ async def root():
                     "languages": "/tesseract/languages/ (GET)",
                 },
                 "pdf_split": {
-                    "file": "/split/file/ (POST) - Returns ZIP file",
+                    "file": "/split/file/ (POST) - Returns JSON with base64 files",
                     "base64": "/split/base64/ (POST) - Returns JSON with base64 files",
                 },
             },
