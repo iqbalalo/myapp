@@ -9,7 +9,7 @@ from fastapi import (
     Depends,
     Request,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Union, Dict, Any, List
 import concurrent.futures
@@ -22,16 +22,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import zipfile
+import io
 
 # Import core processor logic
 from pdf_processor import PDFProcessor
 from image_processor import ImageProcessor
+from pdf_splitter import PDFSplitter
 
 # Configuration
 PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 TEMP_DIR_ROOT = "/tmp/api_uploads"
-# The API_KEYS_FILE constant is now obsolete as keys are stored in the DB
-# API_KEYS_FILE = "api-keys.json"
 
 # Setup logging
 logging.basicConfig(
@@ -42,11 +43,12 @@ logging.basicConfig(
 # Initialize processors
 pdf_processor = PDFProcessor()
 image_processor = ImageProcessor()
+pdf_splitter = PDFSplitter()
 
 app = FastAPI(
     title="PDF and Image OCR Text Extractor API",
-    description="Accepts PDF files and images (JPEG, PNG, TIFF, BMP, GIF, WEBP) for text extraction using hybrid PDF/OCR methods. Requires API key authentication.",
-    version="1.2.0",
+    description="Accepts PDF files and images (JPEG, PNG, TIFF, BMP, GIF, WEBP) for text extraction using hybrid PDF/OCR methods. Also supports PDF splitting. Requires API key authentication.",
+    version="1.3.0",
 )
 
 # Supported image MIME types
@@ -82,9 +84,15 @@ class Base64ImageRequest(BaseModel):
     ocr_language: Optional[str] = "eng+jpn"
 
 
+class PDFSplitRequest(BaseModel):
+    file_base64: str
+    pages_per_split: int
+    original_filename: Optional[str] = "document"
+
+
 class CreateAPIKeyRequest(BaseModel):
     email: EmailStr
-    expires: str  # "never" or number of days like "30", "90", "365"
+    expires: str
 
 
 class DeleteAPIKeyRequest(BaseModel):
@@ -92,15 +100,11 @@ class DeleteAPIKeyRequest(BaseModel):
 
 
 # --- API Key Management Functions ---
+# (Keep all existing API key management functions from the original file)
 
 
 def _get_db_connection():
-    """
-    Gets a database connection.
-
-    Returns:
-        Database connection or None if connection fails
-    """
+    """Gets a database connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         return conn
@@ -110,21 +114,14 @@ def _get_db_connection():
 
 
 def _init_db_tables():
-    """
-    Initializes the api_key_usage and api_keys tables if they don't exist.
-    Creates tables in the 'api' schema.
-    """
+    """Initializes the api_key_usage and api_keys tables if they don't exist."""
     try:
         conn = _get_db_connection()
         if not conn:
             return False
 
         cursor = conn.cursor()
-
-        # Create schema if it doesn't exist
         cursor.execute("CREATE SCHEMA IF NOT EXISTS api;")
-
-        # Create api_key_usage table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS api.api_key_usage (
                 id SERIAL PRIMARY KEY,
@@ -135,8 +132,6 @@ def _init_db_tables():
                 ip TEXT
             );
         """)
-
-        # Create api_keys table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS api.api_keys (
                 id SERIAL PRIMARY KEY,
@@ -146,8 +141,6 @@ def _init_db_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-
-        # Create indexes for faster queries on both tables
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_api_key_usage_api_key
             ON api.api_key_usage(api_key);
@@ -160,14 +153,11 @@ def _init_db_tables():
             CREATE INDEX IF NOT EXISTS idx_api_keys_api_key
             ON api.api_keys(api_key);
         """)
-
         conn.commit()
         cursor.close()
         conn.close()
-
         logging.info("Database tables initialized successfully.")
         return True
-
     except Exception as e:
         logging.error(f"Failed to initialize database tables: {e}")
         return False
@@ -178,10 +168,8 @@ def _load_api_keys() -> Dict[str, Any]:
     conn = _get_db_connection()
     if not conn:
         return {}
-
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT api_key, email, expires, created_at FROM api.api_keys;")
-
     api_keys = {}
     for row in cursor.fetchall():
         api_keys[row["api_key"]] = {
@@ -192,7 +180,6 @@ def _load_api_keys() -> Dict[str, Any]:
             if row["expires"] is None
             else row["expires"].isoformat(),
         }
-
     cursor.close()
     conn.close()
     return api_keys
@@ -201,21 +188,12 @@ def _load_api_keys() -> Dict[str, Any]:
 def _log_api_usage(
     api_key: str, api_endpoint: Optional[str] = None, ip: Optional[str] = None
 ):
-    """
-    Logs API key usage to the database.
-
-    Args:
-        api_key: The API key used
-        api_endpoint: The API endpoint that was called
-        ip: Optional IP address of the requester
-    """
+    """Logs API key usage to the database."""
     try:
         conn = _get_db_connection()
         if not conn:
             logging.warning("Skipping API usage logging - database not accessible")
             return
-
-        # Get email associated with the API key
         email = None
         if api_key == _get_default_api_key():
             email = "master@system"
@@ -223,7 +201,6 @@ def _log_api_usage(
             api_keys = _load_api_keys()
             if api_key in api_keys:
                 email = api_keys[api_key].get("email")
-
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -232,42 +209,24 @@ def _log_api_usage(
         """,
             (email, api_key, api_endpoint, datetime.now(), ip),
         )
-
         conn.commit()
         cursor.close()
         conn.close()
-
         logging.debug(f"API usage logged for {email}")
-
     except Exception as e:
         logging.error(f"Failed to log API usage: {e}")
 
 
 def _get_client_ip(request: Request) -> Optional[str]:
-    """
-    Extracts client IP address from request.
-
-    Args:
-        request: FastAPI Request object
-
-    Returns:
-        IP address string or None
-    """
-    # Check for forwarded IP first (in case of proxy/nginx)
+    """Extracts client IP address from request."""
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        # X-Forwarded-For can contain multiple IPs, get the first one
         return forwarded_for.split(",")[0].strip()
-
-    # Check for real IP
     real_ip = request.headers.get("X-Real-IP")
     if real_ip:
         return real_ip
-
-    # Fall back to direct client IP
     if request.client:
         return request.client.host
-
     return None
 
 
@@ -283,18 +242,9 @@ def _generate_api_key() -> str:
 
 
 def _calculate_expiry_date(expires: str) -> Optional[datetime]:
-    """
-    Calculates expiry date based on input.
-
-    Args:
-        expires: "never" or number of days as string
-
-    Returns:
-        datetime object or None for never
-    """
+    """Calculates expiry date based on input."""
     if expires.lower() == "never":
         return None
-
     try:
         days = int(expires)
         expiry_date = datetime.now() + timedelta(days=days)
@@ -304,24 +254,13 @@ def _calculate_expiry_date(expires: str) -> Optional[datetime]:
 
 
 def _is_api_key_valid(api_key: str) -> bool:
-    """
-    Validates an API key.
-
-    Args:
-        api_key: The API key to validate
-
-    Returns:
-        True if valid, False otherwise
-    """
-    # Check if it's the default master key
+    """Validates an API key."""
     if api_key == _get_default_api_key():
         return True
-
     conn = _get_db_connection()
     if not conn:
         logging.error("Failed to validate API key: Database connection failed.")
         return False
-
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
         "SELECT email, expires FROM api.api_keys WHERE api_key = %s;", (api_key,)
@@ -329,69 +268,37 @@ def _is_api_key_valid(api_key: str) -> bool:
     key_info = cursor.fetchone()
     cursor.close()
     conn.close()
-
     if not key_info:
         return False
-
-    # Check if expired
     if key_info.get("expires"):
         if datetime.now() > key_info["expires"]:
             return False
-
     return True
 
 
 async def verify_api_key(
     request: Request, x_api_key: str = Header(..., alias="X-API-Key")
 ):
-    """
-    Dependency to verify API key from header and log usage.
-
-    Args:
-        request: FastAPI Request object
-        x_api_key: API key from X-API-Key header
-
-    Raises:
-        HTTPException: If API key is invalid or expired
-    """
-    # Get the endpoint path
+    """Dependency to verify API key from header and log usage."""
     endpoint_path = request.url.path
-
     if not _is_api_key_valid(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid or expired API key")
-
-    # Log API usage
     client_ip = _get_client_ip(request)
     _log_api_usage(x_api_key, endpoint_path, client_ip)
-
     return x_api_key
 
 
 async def verify_master_api_key(
     request: Request, x_api_key: str = Header(..., alias="X-API-Key")
 ):
-    """
-    Dependency to verify master API key for admin operations and log usage.
-
-    Args:
-        request: FastAPI Request object
-        x_api_key: API key from X-API-Key header
-
-    Raises:
-        HTTPException: If not the master API key
-    """
-    # Get the endpoint path
+    """Dependency to verify master API key for admin operations and log usage."""
     endpoint_path = request.url.path
-
     if x_api_key != _get_default_api_key():
         raise HTTPException(
             status_code=403, detail="Master API key required for this operation"
         )
-
-    # Log API usage
     client_ip = _get_client_ip(request)
     _log_api_usage(x_api_key, endpoint_path, client_ip)
-
     return x_api_key
 
 
@@ -434,6 +341,27 @@ def _process_image_concurrently(file_data: bytes, ocr_language: str) -> Dict[str
         }
 
 
+def _split_pdf_concurrently(
+    file_data: bytes, pages_per_split: int, original_filename: str
+) -> Dict[str, Any]:
+    """Submits the PDF split task to the dedicated ThreadPoolExecutor."""
+    try:
+        future = PROCESS_EXECUTOR.submit(
+            pdf_splitter.split_pdf, file_data, pages_per_split, original_filename
+        )
+        result = future.result()
+        return result
+    except Exception as e:
+        logging.error(f"Concurrent PDF splitting failed: {e}")
+        return {
+            "success": False,
+            "error": f"Internal Processing Error: {str(e)}",
+            "total_pages": 0,
+            "total_splits": 0,
+            "files": [],
+        }
+
+
 def _setup_temp_dir():
     """Ensure the temporary directory exists."""
     os.makedirs(TEMP_DIR_ROOT, exist_ok=True)
@@ -453,11 +381,7 @@ async def startup_event():
     """Runs when the FastAPI application starts."""
     _setup_temp_dir()
     logging.info("FastAPI service started and temporary directory initialized.")
-
-    # Initialize database table for API usage logging
     _init_db_tables()
-
-    # Log installed Tesseract languages for debugging
     try:
         import pytesseract
 
@@ -465,8 +389,6 @@ async def startup_event():
         logging.info(f"Tesseract installed languages: {languages}")
     except Exception as e:
         logging.error(f"Could not retrieve Tesseract languages: {e}")
-
-    # Log default API key info (masked)
     default_key = _get_default_api_key()
     masked_key = (
         default_key[:8] + "..." + default_key[-4:] if len(default_key) > 12 else "***"
@@ -483,6 +405,7 @@ def shutdown_event():
 
 
 # --- API Key Management Endpoints ---
+# (Keep all existing API key management endpoints - create, list, delete, usage)
 
 
 @app.post("/api-keys/create/")
@@ -490,26 +413,13 @@ async def create_api_key(
     request: CreateAPIKeyRequest,
     _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
-    """
-    Creates a new API key (requires master API key).
-
-    Args:
-        request: Email and expiration details
-
-    Returns:
-        New API key details
-    """
+    """Creates a new API key (requires master API key)."""
     try:
-        # Generate new key
         new_key = _generate_api_key()
-
-        # Calculate expiry
         expiry_date_dt = _calculate_expiry_date(request.expires)
-
         conn = _get_db_connection()
         if not conn:
             raise HTTPException(status_code=503, detail="Database not accessible")
-
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -520,11 +430,9 @@ async def create_api_key(
             (new_key, request.email, expiry_date_dt),
         )
         created_at = cursor.fetchone()[0]
-
         conn.commit()
         cursor.close()
         conn.close()
-
         return JSONResponse(
             content={
                 "success": True,
@@ -535,7 +443,6 @@ async def create_api_key(
                 "message": "API key created successfully. Store this key securely - it won't be shown again.",
             }
         )
-
     except psycopg2.errors.UniqueViolation:
         raise HTTPException(
             status_code=409, detail="API key already exists, please try again."
@@ -551,30 +458,21 @@ async def create_api_key(
 
 @app.get("/api-keys/list/")
 async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse:
-    """
-    Lists all API keys (requires master API key).
-
-    Returns:
-        List of all API keys with their details (keys are masked)
-    """
+    """Lists all API keys (requires master API key)."""
     try:
         conn = _get_db_connection()
         if not conn:
             raise HTTPException(status_code=503, detail="Database not accessible")
-
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("SELECT api_key, email, created_at, expires FROM api.api_keys;")
         db_keys = cursor.fetchall()
-
         cursor.close()
         conn.close()
-
         masked_keys = []
         for key_info in db_keys:
             is_expired = False
             if key_info.get("expires"):
                 is_expired = datetime.now() > key_info["expires"]
-
             masked_keys.append(
                 {
                     "api_key_masked": key_info["api_key"][:12]
@@ -591,7 +489,6 @@ async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse
                     "status": "Expired" if is_expired else "Active",
                 }
             )
-
         return JSONResponse(
             content={
                 "success": True,
@@ -599,7 +496,6 @@ async def list_api_keys(_: str = Depends(verify_master_api_key)) -> JSONResponse
                 "api_keys": masked_keys,
             }
         )
-
     except Exception as e:
         logging.error(f"Error listing API keys: {e}")
         raise HTTPException(
@@ -612,47 +508,29 @@ async def delete_api_key(
     request: DeleteAPIKeyRequest,
     _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
-    """
-    Deletes an API key (requires master API key).
-
-    Args:
-        request: API key to delete
-
-    Returns:
-        Deletion confirmation
-    """
+    """Deletes an API key (requires master API key)."""
     try:
-        # Prevent deletion of master key
         if request.api_key == _get_default_api_key():
             raise HTTPException(
                 status_code=400, detail="Cannot delete the master API key"
             )
-
         conn = _get_db_connection()
         if not conn:
             raise HTTPException(status_code=503, detail="Database not accessible")
-
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Check if key exists and get its info before deletion
         cursor.execute(
             "SELECT email, created_at FROM api.api_keys WHERE api_key = %s;",
             (request.api_key,),
         )
         key_info = cursor.fetchone()
-
         if not key_info:
             raise HTTPException(status_code=404, detail="API key not found")
-
-        # Delete the key
         cursor.execute(
             "DELETE FROM api.api_keys WHERE api_key = %s;", (request.api_key,)
         )
         conn.commit()
-
         cursor.close()
         conn.close()
-
         return JSONResponse(
             content={
                 "success": True,
@@ -665,7 +543,6 @@ async def delete_api_key(
                 },
             }
         )
-
     except HTTPException:
         raise
     except Exception as e:
@@ -683,27 +560,13 @@ async def get_api_usage_stats(
     limit: Optional[int] = 100,
     _: str = Depends(verify_master_api_key),
 ) -> JSONResponse:
-    """
-    Gets API usage statistics (requires master API key).
-
-    Args:
-        api_key: Optional - filter by specific API key
-        email: Optional - filter by user email
-        limit: Maximum number of records to return (default: 100)
-
-    Returns:
-        API usage statistics
-    """
+    """Gets API usage statistics (requires master API key)."""
     try:
         conn = _get_db_connection()
         if not conn:
             raise HTTPException(status_code=503, detail="Database not accessible")
-
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Build query based on filters
         if api_key and email:
-            # Filter by both api_key and email
             cursor.execute(
                 """
                 SELECT id, email, api_key, used, ip
@@ -715,7 +578,6 @@ async def get_api_usage_stats(
                 (api_key, email, limit),
             )
         elif api_key:
-            # Filter by api_key only
             cursor.execute(
                 """
                 SELECT id, email, api_key, used, ip
@@ -727,7 +589,6 @@ async def get_api_usage_stats(
                 (api_key, limit),
             )
         elif email:
-            # Filter by email only
             cursor.execute(
                 """
                 SELECT id, email, api_key, used, ip
@@ -739,7 +600,6 @@ async def get_api_usage_stats(
                 (email, limit),
             )
         else:
-            # Get all usage
             cursor.execute(
                 """
                 SELECT id, email, api_key, used, ip
@@ -749,10 +609,7 @@ async def get_api_usage_stats(
             """,
                 (limit,),
             )
-
         records = cursor.fetchall()
-
-        # Get summary statistics (with same filters)
         if api_key and email:
             cursor.execute(
                 """
@@ -805,13 +662,9 @@ async def get_api_usage_stats(
                     MAX(used) as last_request
                 FROM api.api_key_usage;
             """)
-
         summary = cursor.fetchone()
-
         cursor.close()
         conn.close()
-
-        # Convert records to serializable format
         usage_records = []
         for record in records:
             usage_records.append(
@@ -827,7 +680,6 @@ async def get_api_usage_stats(
                     "ip": record["ip"],
                 }
             )
-
         return JSONResponse(
             content={
                 "success": True,
@@ -846,7 +698,6 @@ async def get_api_usage_stats(
                 "records": usage_records,
             }
         )
-
     except HTTPException:
         raise
     except Exception as e:
@@ -891,11 +742,7 @@ async def extract_text_from_file(
     ),
     _: str = Depends(verify_api_key),
 ) -> JSONResponse:
-    """
-    Accepts a PDF or image file via multipart/form-data and extracts text.
-    For PDFs: Uses hybrid PDF/OCR extraction.
-    For images: Uses OCR directly.
-    """
+    """Accepts a PDF or image file via multipart/form-data and extracts text."""
     content_type = file.content_type.lower()
 
     # Validate file type
@@ -947,9 +794,7 @@ async def extract_text_from_base64(
     request: Base64FileRequest,
     _: str = Depends(verify_api_key),
 ) -> JSONResponse:
-    """
-    Accepts a PDF file encoded as a Base64 string and extracts text.
-    """
+    """Accepts a PDF file encoded as a Base64 string and extracts text."""
     try:
         # Convert Base64 to binary data
         file_data = base64.b64decode(request.file_base64)
@@ -990,9 +835,7 @@ async def extract_text_from_image_base64(
     request: Base64ImageRequest,
     _: str = Depends(verify_api_key),
 ) -> JSONResponse:
-    """
-    Accepts an image file encoded as a Base64 string and extracts text using OCR.
-    """
+    """Accepts an image file encoded as a Base64 string and extracts text using OCR."""
     try:
         # Convert Base64 to binary data
         file_data = base64.b64decode(request.file_base64)
@@ -1020,13 +863,255 @@ async def extract_text_from_image_base64(
         )
 
 
+# --- NEW PDF Split Endpoints ---
+
+
+@app.post("/split/file/")
+async def split_pdf_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="PDF file to split"),
+    pages_per_split: int = Form(
+        ..., description="Number of pages per split file", ge=1
+    ),
+    output: str = Form("json", description="Output format: 'json', 'zip', or 'files'"),
+    _: str = Depends(verify_api_key),
+):
+    """
+    Splits a PDF file into multiple smaller PDF files.
+
+    Args:
+        file: PDF file to split
+        pages_per_split: Number of pages per split file (must be >= 1)
+        output: Output format:
+            - 'json': Returns JSON with base64-encoded files (default)
+            - 'zip': Returns ZIP archive containing all files
+            - 'files': Returns first split file (use with file_index param for others)
+
+    Returns:
+        JSON, ZIP file, or individual PDF based on output parameter
+    """
+    content_type = file.content_type.lower()
+
+    # Validate file type
+    if content_type != "application/pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {content_type}. Only PDF files are supported.",
+        )
+
+    # Validate output parameter
+    if output.lower() not in ["zip", "json", "files"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid output format. Must be 'zip', 'json', or 'files'.",
+        )
+
+    try:
+        # Read file data
+        file_data = await file.read()
+        original_filename = file.filename or "document.pdf"
+
+        # Split the PDF
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            _split_pdf_concurrently,
+            file_data,
+            pages_per_split,
+            original_filename,
+        )
+
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail="PDF split failed")
+
+        # Return based on output format
+        if output.lower() == "zip":
+            # Create ZIP file in memory
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for file_info in result["files"]:
+                    zip_file.writestr(file_info["filename"], file_info["file_data"])
+
+            zip_buffer.seek(0)
+
+            # Get base filename for ZIP
+            base_filename = (
+                original_filename.rsplit(".", 1)[0]
+                if "." in original_filename
+                else original_filename
+            )
+
+            return StreamingResponse(
+                zip_buffer,
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f"attachment; filename={base_filename}_splits.zip",
+                    "X-Total-Pages": str(result["total_pages"]),
+                    "X-Total-Splits": str(result["total_splits"]),
+                },
+            )
+
+        elif output.lower() == "files":
+            # Return individual files as multipart response
+            # NOTE: This returns ALL files in a single multipart response
+            from fastapi.responses import Response
+            import uuid
+
+            boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
+
+            # Build multipart response
+            parts = []
+            for file_info in result["files"]:
+                part = (
+                    (
+                        f"--{boundary}\r\n"
+                        f'Content-Disposition: form-data; name="file"; filename="{file_info["filename"]}"\r\n'
+                        f"Content-Type: application/pdf\r\n"
+                        f"X-Page-Range: {file_info['pages']}\r\n"
+                        f"X-Page-Count: {file_info['page_count']}\r\n"
+                        f"\r\n"
+                    ).encode("utf-8")
+                    + file_info["file_data"]
+                    + b"\r\n"
+                )
+                parts.append(part)
+
+            # Final boundary
+            parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+
+            multipart_body = b"".join(parts)
+
+            return Response(
+                content=multipart_body,
+                media_type=f"multipart/form-data; boundary={boundary}",
+                headers={
+                    "X-Total-Pages": str(result["total_pages"]),
+                    "X-Total-Splits": str(result["total_splits"]),
+                },
+            )
+
+        else:  # output == "json"
+            # Convert file data to base64 for JSON response
+            files_with_base64 = []
+            for file_info in result["files"]:
+                files_with_base64.append(
+                    {
+                        "filename": file_info["filename"],
+                        "file_base64": base64.b64encode(file_info["file_data"]).decode(
+                            "utf-8"
+                        ),
+                        "pages": file_info["pages"],
+                        "page_count": file_info["page_count"],
+                        "size_bytes": file_info["size_bytes"],
+                    }
+                )
+
+            return JSONResponse(
+                content={
+                    "success": True,
+                    "total_pages": result["total_pages"],
+                    "total_splits": result["total_splits"],
+                    "files": files_with_base64,
+                }
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during PDF split from file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to split PDF: {str(e)}")
+
+
+@app.post("/split/base64/")
+async def split_pdf_from_base64(
+    request: PDFSplitRequest,
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Splits a PDF file (provided as base64) into multiple smaller PDF files.
+    Returns the split files as base64-encoded strings in JSON.
+
+    Args:
+        request: Contains base64-encoded PDF, pages_per_split, and optional filename
+
+    Returns:
+        JSON with split file information and base64-encoded file data
+    """
+    try:
+        # Validate pages_per_split
+        if request.pages_per_split < 1:
+            raise HTTPException(
+                status_code=400, detail="pages_per_split must be at least 1"
+            )
+
+        # Convert Base64 to binary data
+        try:
+            file_data = base64.b64decode(request.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 string format.")
+
+        # Check if it's PDF data
+        if not file_data.startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=400,
+                detail="Base64 string does not decode to valid PDF data.",
+            )
+
+        # Split the PDF
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            _split_pdf_concurrently,
+            file_data,
+            request.pages_per_split,
+            request.original_filename,
+        )
+
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail="PDF split failed")
+
+        # Convert file data to base64 for JSON response
+        files_with_base64 = []
+        for file_info in result["files"]:
+            files_with_base64.append(
+                {
+                    "filename": file_info["filename"],
+                    "file_base64": base64.b64encode(file_info["file_data"]).decode(
+                        "utf-8"
+                    ),
+                    "pages": file_info["pages"],
+                    "page_count": file_info["page_count"],
+                    "size_bytes": file_info["size_bytes"],
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "total_pages": result["total_pages"],
+                "total_splits": result["total_splits"],
+                "files": files_with_base64,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during PDF split from base64: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to split PDF: {str(e)}")
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
     return JSONResponse(
         content={
             "message": "PDF and Image OCR Text Extractor API",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "documentation": "/docs",
             "authentication": "All endpoints require X-API-Key header",
             "endpoints": {
@@ -1041,6 +1126,10 @@ async def root():
                     "pdf_base64": "/extract/base64/ (POST)",
                     "image_base64": "/extract/image/base64/ (POST)",
                     "languages": "/tesseract/languages/ (GET)",
+                },
+                "pdf_split": {
+                    "file": "/split/file/ (POST) - Returns ZIP file",
+                    "base64": "/split/base64/ (POST) - Returns JSON with base64 files",
                 },
             },
         }
