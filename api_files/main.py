@@ -318,7 +318,7 @@ def _process_pdf_concurrently(
     except Exception as e:
         logging.error(f"Concurrent PDF processing failed: {e}")
         return {
-            "file_hash": "N/A",
+            "file_hash": None,
             "file_text": None,
             "error": f"Internal Processing Error: {str(e)}",
         }
@@ -335,7 +335,7 @@ def _process_image_concurrently(file_data: bytes, ocr_language: str) -> Dict[str
     except Exception as e:
         logging.error(f"Concurrent image processing failed: {e}")
         return {
-            "file_hash": "N/A",
+            "file_hash": None,
             "file_text": None,
             "error": f"Internal Processing Error: {str(e)}",
         }
