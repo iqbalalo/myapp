@@ -26,7 +26,7 @@ import zipfile
 import io
 
 # Import core processor logic
-from pdf_processor import PDFProcessor
+from pdf_processor import PDFProcessor, create_file_hash
 from image_processor import ImageProcessor
 from pdf_splitter import PDFSplitter
 
@@ -1025,6 +1025,29 @@ async def split_pdf_from_base64(
     except Exception as e:
         logging.error(f"Error during PDF split from base64: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to split PDF: {str(e)}")
+
+
+class FileHashResponse(BaseModel):
+    file_hash: str
+
+
+@app.post("/file-hash/", response_model=FileHashResponse)
+async def get_file_hash(
+    file: UploadFile = File(..., description="File to get hash for"),
+    _: str = Depends(verify_api_key),
+):
+    """
+    Accepts a file via multipart/form-data and returns its SHA256 hash.
+    """
+    try:
+        file_data = await file.read()
+        file_hash = create_file_hash(file_data)
+        return {"file_hash": file_hash}  # Return dict instead of JSONResponse
+    except Exception as e:
+        logging.error(f"Error getting file hash: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to process file for hashing: {str(e)}"
+        )
 
 
 @app.get("/")
