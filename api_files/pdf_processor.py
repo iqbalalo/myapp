@@ -365,9 +365,67 @@ class PDFProcessor:
             if not response["file_text"].strip():
                 response["file_text"] = "[No text could be extracted from this PDF]"
 
+            # image-based page information
+            image_pages = [
+                page_num
+                for page_num, _, method in final_results
+                if method in ("OCR", "OCR_PENDING")
+            ]
+            response["metadata"]["image_based_pages"] = {
+                "count": len(image_pages),
+                "page_numbers": image_pages,
+                "note": "These pages had insufficient selectable text and required OCR",
+            }
+
         except Exception as e:
             response["error"] = f"Extraction Failed: {type(e).__name__} - {str(e)}"
             logging.error(f"Extraction failed: {response['error']}")
+
+        return response
+
+    def analyze_pdf_structure(self, pdf_data: bytes) -> Dict[str, Any]:
+        """
+        Analyzes PDF structure to identify image-based pages without performing OCR.
+        This is a lightweight operation that only checks for selectable text.
+
+        Args:
+            pdf_data: Binary PDF data
+
+        Returns:
+            Dictionary containing:
+                - file_hash: SHA256 hash of the file
+                - total_pages: Total number of pages
+                - text_based_pages: List of page numbers with selectable text
+                - image_based_pages: List of page numbers that are likely images
+                - error: Error message if analysis failed (None otherwise)
+        """
+        response = {
+            "file_hash": create_file_hash(pdf_data),
+            "total_pages": 0,
+            "text_based_pages": [],
+            "image_based_pages": [],
+            "error": None,
+        }
+
+        try:
+            # Extract text from all pages
+            pdf_pages = self._extract_text_from_pdf_memory(pdf_data)
+
+            if not pdf_pages:
+                raise ValueError("Could not extract any page data from PDF")
+
+            response["total_pages"] = len(pdf_pages)
+
+            # Classify pages based on text richness
+            for page_num, text, is_rich in pdf_pages:
+                if is_rich:
+                    response["text_based_pages"].append(page_num)
+                else:
+                    response["image_based_pages"].append(page_num)
+
+        except Exception as e:
+            response["error"] = f"Analysis Failed: {type(e).__name__} - {str(e)}"
+            logging.error(f"PDF structure analysis failed: {response['error']}")
 
         return response
 

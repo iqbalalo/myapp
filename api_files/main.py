@@ -47,8 +47,8 @@ pdf_splitter = PDFSplitter()
 
 app = FastAPI(
     title="PDF and Image OCR Text Extractor API",
-    description="Accepts PDF files and images (JPEG, PNG, TIFF, BMP, GIF, WEBP) for text extraction using hybrid PDF/OCR methods. Also supports PDF splitting. Requires API key authentication.",
-    version="1.3.0",
+    description="Accepts PDF files and images (JPEG, PNG, TIFF, BMP, GIF, WEBP) for text extraction using hybrid PDF/OCR methods. Identifies image-based (non-editable) pages. Also supports PDF splitting. Requires API key authentication.",
+    version="1.4.0",
 )
 
 # Supported image MIME types
@@ -359,6 +359,23 @@ def _split_pdf_concurrently(
             "total_pages": 0,
             "total_splits": 0,
             "files": [],
+        }
+
+
+def _analyze_pdf_structure_concurrently(file_data: bytes) -> Dict[str, Any]:
+    """Submits the PDF structure analysis task to the dedicated ThreadPoolExecutor."""
+    try:
+        future = PROCESS_EXECUTOR.submit(pdf_processor.analyze_pdf_structure, file_data)
+        result = future.result()
+        return result
+    except Exception as e:
+        logging.error(f"Concurrent PDF analysis failed: {e}")
+        return {
+            "file_hash": None,
+            "total_pages": 0,
+            "text_based_pages": [],
+            "image_based_pages": [],
+            "error": f"Internal Processing Error: {str(e)}",
         }
 
 
@@ -1027,6 +1044,135 @@ async def split_pdf_from_base64(
         raise HTTPException(status_code=500, detail=f"Failed to split PDF: {str(e)}")
 
 
+# --- PDF Structure Analysis Endpoints ---
+
+
+@app.post("/analyze/file/")
+async def analyze_pdf_structure_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="PDF file to analyze"),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Analyzes PDF structure to identify image-based pages without performing OCR.
+    This is a fast, lightweight operation.
+
+    Args:
+        file: PDF file to analyze
+
+    Returns:
+        JSON with page classification (text-based vs image-based)
+    """
+    content_type = file.content_type.lower()
+
+    # Validate file type
+    if content_type != "application/pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {content_type}. Only PDF files are supported.",
+        )
+
+    try:
+        # Read file data
+        file_data = await file.read()
+
+        # Analyze the PDF structure
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            _analyze_pdf_structure_concurrently,
+            file_data,
+        )
+
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "file_hash": result["file_hash"],
+                "total_pages": result["total_pages"],
+                "text_based_pages": {
+                    "count": len(result["text_based_pages"]),
+                    "page_numbers": result["text_based_pages"],
+                },
+                "image_based_pages": {
+                    "count": len(result["image_based_pages"]),
+                    "page_numbers": result["image_based_pages"],
+                    "note": "These pages have insufficient selectable text and would require OCR for text extraction",
+                },
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during PDF structure analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze PDF: {str(e)}")
+
+
+@app.post("/analyze/base64/")
+async def analyze_pdf_structure_from_base64(
+    request: Base64FileRequest,
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Analyzes PDF structure (from base64) to identify image-based pages without performing OCR.
+    This is a fast, lightweight operation.
+
+    Args:
+        request: Contains base64-encoded PDF
+
+    Returns:
+        JSON with page classification (text-based vs image-based)
+    """
+    try:
+        # Convert Base64 to binary data
+        try:
+            file_data = base64.b64decode(request.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 string format.")
+
+        # Check if it's PDF data
+        if not file_data.startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=400,
+                detail="Base64 string does not decode to valid PDF data.",
+            )
+
+        # Analyze the PDF structure
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            _analyze_pdf_structure_concurrently,
+            file_data,
+        )
+
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "file_hash": result["file_hash"],
+                "total_pages": result["total_pages"],
+                "text_based_pages": {
+                    "count": len(result["text_based_pages"]),
+                    "page_numbers": result["text_based_pages"],
+                },
+                "image_based_pages": {
+                    "count": len(result["image_based_pages"]),
+                    "page_numbers": result["image_based_pages"],
+                    "note": "These pages have insufficient selectable text and would require OCR for text extraction",
+                },
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during PDF structure analysis from base64: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze PDF: {str(e)}")
+
+
 class FileHashResponse(BaseModel):
     file_hash: str
 
@@ -1056,7 +1202,7 @@ async def root():
     return JSONResponse(
         content={
             "message": "PDF and Image OCR Text Extractor API",
-            "version": "1.3.0",
+            "version": "1.4.0",
             "documentation": "/docs",
             "authentication": "All endpoints require X-API-Key header",
             "endpoints": {
@@ -1075,6 +1221,10 @@ async def root():
                 "pdf_split": {
                     "file": "/split/file/ (POST) - Returns JSON with base64 files",
                     "base64": "/split/base64/ (POST) - Returns JSON with base64 files",
+                },
+                "pdf_analysis": {
+                    "file": "/analyze/file/ (POST) - Identify image-based pages (fast, no OCR)",
+                    "base64": "/analyze/base64/ (POST) - Identify image-based pages (fast, no OCR)",
                 },
             },
         }
