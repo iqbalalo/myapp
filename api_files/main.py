@@ -29,6 +29,8 @@ import io
 from pdf_processor import PDFProcessor, create_file_hash
 from image_processor import ImageProcessor
 from pdf_splitter import PDFSplitter
+from media_converter_api import MediaConverterAPI
+from image_to_webp_api import ImageToWebPAPI
 
 # Configuration
 PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
@@ -44,11 +46,13 @@ logging.basicConfig(
 pdf_processor = PDFProcessor()
 image_processor = ImageProcessor()
 pdf_splitter = PDFSplitter()
+media_converter = MediaConverterAPI()
+image_to_webp = ImageToWebPAPI()
 
 app = FastAPI(
-    title="PDF and Image OCR Text Extractor API",
-    description="Accepts PDF files and images (JPEG, PNG, TIFF, BMP, GIF, WEBP) for text extraction using hybrid PDF/OCR methods. Identifies image-based (non-editable) pages. Also supports PDF splitting. Requires API key authentication.",
-    version="1.4.0",
+    title="PDF, Image OCR, and Media Converter API",
+    description="Comprehensive API for PDF/Image text extraction, OCR, PDF splitting, image to WebP conversion, and media (audio/video) conversion. Requires API key authentication.",
+    version="1.5.0",
 )
 
 # Supported image MIME types
@@ -97,6 +101,27 @@ class CreateAPIKeyRequest(BaseModel):
 
 class DeleteAPIKeyRequest(BaseModel):
     api_key: str
+
+
+class MediaConversionRequest(BaseModel):
+    file_base64: str
+    filename: str
+    bitrate: Optional[str] = "192k"
+
+
+class VideoCompressionRequest(BaseModel):
+    file_base64: str
+    filename: str
+    resolution: Optional[str] = "720p"
+    bitrate: Optional[str] = "1000k"
+
+
+class ImageToWebPRequest(BaseModel):
+    file_base64: str
+    filename: str
+    quality: Optional[int] = 80
+    max_width: Optional[int] = None
+    max_height: Optional[int] = None
 
 
 # --- API Key Management Functions ---
@@ -1201,8 +1226,8 @@ async def root():
     """Root endpoint with API information."""
     return JSONResponse(
         content={
-            "message": "PDF and Image OCR Text Extractor API",
-            "version": "1.4.0",
+            "message": "PDF, Image OCR, and Media Converter API",
+            "version": "1.5.0",
             "documentation": "/docs",
             "authentication": "All endpoints require X-API-Key header",
             "endpoints": {
@@ -1226,6 +1251,516 @@ async def root():
                     "file": "/analyze/file/ (POST) - Identify image-based pages (fast, no OCR)",
                     "base64": "/analyze/base64/ (POST) - Identify image-based pages (fast, no OCR)",
                 },
+                "media_conversion": {
+                    "mp3_file": "/convert/mp3/file/ (POST) - Convert audio/video to MP3 (file upload)",
+                    "mp3_base64": "/convert/mp3/base64/ (POST) - Convert audio/video to MP3 (base64)",
+                    "compress_video_file": "/convert/compress-video/file/ (POST) - Compress video (file upload)",
+                    "compress_video_base64": "/convert/compress-video/base64/ (POST) - Compress video (base64)",
+                    "video_info": "/convert/video-info/file/ (POST) - Get video information",
+                },
+                "image_conversion": {
+                    "webp_file": "/convert/webp/file/ (POST) - Convert image to WebP (file upload)",
+                    "webp_base64": "/convert/webp/base64/ (POST) - Convert image to WebP (base64)",
+                    "image_info": "/convert/image-info/file/ (POST) - Get image information",
+                },
             },
         }
     )
+
+
+# --- Media Conversion Endpoints ---
+
+
+@app.post("/convert/mp3/file/")
+async def convert_to_mp3_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="Audio or video file to convert to MP3"),
+    bitrate: str = Form(
+        "192k", description="Audio bitrate (e.g., 128k, 192k, 256k, 320k)"
+    ),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Convert audio/video file to MP3 format.
+    Supports: MP4, M4A, MP3, WAV, AAC, FLAC, OGG, AVI, MOV, MKV, etc.
+
+    Args:
+        file: Audio or video file to convert
+        bitrate: Audio bitrate for output MP3 (default: 192k)
+
+    Returns:
+        JSON with base64-encoded MP3 file and conversion info
+    """
+    try:
+        # Log API usage
+        client_ip = _get_client_ip(fastapi_request)
+        _log_api_usage(_, "/convert/mp3/file/", client_ip)
+
+        # Read file data
+        file_data = await file.read()
+        filename = file.filename or "audio.mp3"
+
+        # Convert to MP3
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            media_converter.convert_to_mp3,
+            file_data,
+            filename,
+            bitrate,
+        )
+
+        mp3_data, output_filename = result
+
+        # Get file sizes for comparison
+        input_size = len(file_data)
+        output_size = len(mp3_data)
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "original_filename": filename,
+                "output_filename": output_filename,
+                "file_base64": base64.b64encode(mp3_data).decode("utf-8"),
+                "bitrate": bitrate,
+                "input_size_kb": round(input_size / 1024, 2),
+                "output_size_kb": round(output_size / 1024, 2),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during MP3 conversion: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert to MP3: {str(e)}"
+        )
+
+
+@app.post("/convert/mp3/base64/")
+async def convert_to_mp3_from_base64(
+    request: MediaConversionRequest,
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Convert audio/video file to MP3 format (from base64).
+    Supports: MP4, M4A, MP3, WAV, AAC, FLAC, OGG, AVI, MOV, MKV, etc.
+
+    Args:
+        request: Contains base64-encoded file, filename, and optional bitrate
+
+    Returns:
+        JSON with base64-encoded MP3 file and conversion info
+    """
+    try:
+        # Convert Base64 to binary data
+        try:
+            file_data = base64.b64decode(request.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 string format.")
+
+        # Convert to MP3
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            media_converter.convert_to_mp3,
+            file_data,
+            request.filename,
+            request.bitrate,
+        )
+
+        mp3_data, output_filename = result
+
+        # Get file sizes for comparison
+        input_size = len(file_data)
+        output_size = len(mp3_data)
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "original_filename": request.filename,
+                "output_filename": output_filename,
+                "file_base64": base64.b64encode(mp3_data).decode("utf-8"),
+                "bitrate": request.bitrate,
+                "input_size_kb": round(input_size / 1024, 2),
+                "output_size_kb": round(output_size / 1024, 2),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during MP3 conversion from base64: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert to MP3: {str(e)}"
+        )
+
+
+@app.post("/convert/compress-video/file/")
+async def compress_video_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="Video file to compress (MP4)"),
+    resolution: str = Form(
+        "720p", description="Target resolution (1080p, 720p, 480p, 360p)"
+    ),
+    bitrate: str = Form(
+        "1000k", description="Video bitrate (e.g., 1000k, 2000k, 3000k)"
+    ),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Compress video file by reducing resolution and/or bitrate.
+
+    Args:
+        file: Video file to compress (MP4 format)
+        resolution: Target resolution (default: 720p)
+        bitrate: Video bitrate (default: 1000k)
+
+    Returns:
+        JSON with base64-encoded compressed video and compression info
+    """
+    try:
+        # Log API usage
+        client_ip = _get_client_ip(fastapi_request)
+        _log_api_usage(_, "/convert/compress-video/file/", client_ip)
+
+        # Validate file type
+        if not file.filename.lower().endswith(".mp4"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only MP4 files are supported for video compression.",
+            )
+
+        # Read file data
+        file_data = await file.read()
+        filename = file.filename or "video.mp4"
+
+        # Compress video
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            media_converter.compress_video,
+            file_data,
+            filename,
+            resolution,
+            bitrate,
+        )
+
+        compressed_data, output_filename = result
+
+        # Get file sizes for comparison
+        input_size = len(file_data)
+        output_size = len(compressed_data)
+        reduction = ((input_size - output_size) / input_size) * 100
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "original_filename": filename,
+                "output_filename": output_filename,
+                "file_base64": base64.b64encode(compressed_data).decode("utf-8"),
+                "resolution": resolution,
+                "bitrate": bitrate,
+                "input_size_mb": round(input_size / (1024 * 1024), 2),
+                "output_size_mb": round(output_size / (1024 * 1024), 2),
+                "size_reduction_percent": round(reduction, 1),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during video compression: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compress video: {str(e)}"
+        )
+
+
+@app.post("/convert/compress-video/base64/")
+async def compress_video_from_base64(
+    request: VideoCompressionRequest,
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Compress video file by reducing resolution and/or bitrate (from base64).
+
+    Args:
+        request: Contains base64-encoded video, filename, resolution, and bitrate
+
+    Returns:
+        JSON with base64-encoded compressed video and compression info
+    """
+    try:
+        # Convert Base64 to binary data
+        try:
+            file_data = base64.b64decode(request.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 string format.")
+
+        # Validate filename
+        if not request.filename.lower().endswith(".mp4"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only MP4 files are supported for video compression.",
+            )
+
+        # Compress video
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            media_converter.compress_video,
+            file_data,
+            request.filename,
+            request.resolution,
+            request.bitrate,
+        )
+
+        compressed_data, output_filename = result
+
+        # Get file sizes for comparison
+        input_size = len(file_data)
+        output_size = len(compressed_data)
+        reduction = ((input_size - output_size) / input_size) * 100
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "original_filename": request.filename,
+                "output_filename": output_filename,
+                "file_base64": base64.b64encode(compressed_data).decode("utf-8"),
+                "resolution": request.resolution,
+                "bitrate": request.bitrate,
+                "input_size_mb": round(input_size / (1024 * 1024), 2),
+                "output_size_mb": round(output_size / (1024 * 1024), 2),
+                "size_reduction_percent": round(reduction, 1),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during video compression from base64: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compress video: {str(e)}"
+        )
+
+
+@app.post("/convert/video-info/file/")
+async def get_video_info_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="Video file to analyze"),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Get information about a video file (duration, resolution, fps, etc.).
+
+    Args:
+        file: Video file to analyze
+
+    Returns:
+        JSON with video information
+    """
+    try:
+        # Log API usage
+        client_ip = _get_client_ip(fastapi_request)
+        _log_api_usage(_, "/convert/video-info/file/", client_ip)
+
+        # Read file data
+        file_data = await file.read()
+        filename = file.filename or "video.mp4"
+
+        # Get video info
+        info = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            media_converter.get_video_info,
+            file_data,
+            filename,
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "filename": filename,
+                "video_info": info,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error getting video info: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get video info: {str(e)}"
+        )
+
+
+# --- Image to WebP Conversion Endpoints ---
+
+
+@app.post("/convert/webp/file/")
+async def convert_to_webp_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="Image file to convert to WebP"),
+    quality: int = Form(80, description="WebP quality (1-100)"),
+    max_width: Optional[int] = Form(None, description="Maximum width in pixels"),
+    max_height: Optional[int] = Form(None, description="Maximum height in pixels"),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Convert image to WebP format with optional resizing.
+    Supports: PNG, JPEG, JPG, BMP, TIFF, GIF
+
+    Args:
+        file: Image file to convert
+        quality: Output quality (1-100, default: 80)
+        max_width: Optional maximum width (maintains aspect ratio)
+        max_height: Optional maximum height (maintains aspect ratio)
+
+    Returns:
+        JSON with base64-encoded WebP file and conversion info
+    """
+    try:
+        # Log API usage
+        client_ip = _get_client_ip(fastapi_request)
+        _log_api_usage(_, "/convert/webp/file/", client_ip)
+
+        # Validate quality
+        if not 1 <= quality <= 100:
+            raise HTTPException(
+                status_code=400, detail="Quality must be between 1 and 100."
+            )
+
+        # Read file data
+        file_data = await file.read()
+        filename = file.filename or "image.webp"
+
+        # Convert to WebP
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            image_to_webp.convert_to_webp,
+            file_data,
+            filename,
+            quality,
+            max_width,
+            max_height,
+        )
+
+        webp_data, output_filename, info = result
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "file_base64": base64.b64encode(webp_data).decode("utf-8"),
+                "conversion_info": info,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during WebP conversion: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert to WebP: {str(e)}"
+        )
+
+
+@app.post("/convert/webp/base64/")
+async def convert_to_webp_from_base64(
+    request: ImageToWebPRequest,
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Convert image to WebP format with optional resizing (from base64).
+    Supports: PNG, JPEG, JPG, BMP, TIFF, GIF
+
+    Args:
+        request: Contains base64-encoded image, filename, quality, and optional dimensions
+
+    Returns:
+        JSON with base64-encoded WebP file and conversion info
+    """
+    try:
+        # Validate quality
+        if not 1 <= request.quality <= 100:
+            raise HTTPException(
+                status_code=400, detail="Quality must be between 1 and 100."
+            )
+
+        # Convert Base64 to binary data
+        try:
+            file_data = base64.b64decode(request.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 string format.")
+
+        # Convert to WebP
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            image_to_webp.convert_to_webp,
+            file_data,
+            request.filename,
+            request.quality,
+            request.max_width,
+            request.max_height,
+        )
+
+        webp_data, output_filename, info = result
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "file_base64": base64.b64encode(webp_data).decode("utf-8"),
+                "conversion_info": info,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error during WebP conversion from base64: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert to WebP: {str(e)}"
+        )
+
+
+@app.post("/convert/image-info/file/")
+async def get_image_info_from_file(
+    fastapi_request: Request,
+    file: UploadFile = File(..., description="Image file to analyze"),
+    _: str = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Get information about an image file (format, dimensions, size, etc.).
+
+    Args:
+        file: Image file to analyze
+
+    Returns:
+        JSON with image information
+    """
+    try:
+        # Log API usage
+        client_ip = _get_client_ip(fastapi_request)
+        _log_api_usage(_, "/convert/image-info/file/", client_ip)
+
+        # Read file data
+        file_data = await file.read()
+        filename = file.filename or "image"
+
+        # Get image info
+        info = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            image_to_webp.get_image_info,
+            file_data,
+            filename,
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "image_info": info,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error getting image info: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get image info: {str(e)}"
+        )
