@@ -8,7 +8,9 @@ import os
 import io
 import tempfile
 from typing import Tuple, Optional
-from moviepy.editor import VideoFileClip, AudioFileClip
+
+# MoviePy 2.x imports - direct import from moviepy (not moviepy.editor)
+from moviepy import VideoFileClip, AudioFileClip
 import logging
 
 logger = logging.getLogger(__name__)
