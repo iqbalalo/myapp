@@ -1,3 +1,5 @@
+# myapp/Dockerfile.api
+
 # Use the Python 3.11 slim image
 FROM python:3.11-slim
 
@@ -5,7 +7,6 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Step 1: Install ALL System-level Dependencies (Tesseract, Poppler, Image libs, Magic libs)
-# We use the final working package list: libmagic1t64 and libmagic-dev.
 RUN apt-get clean && apt-get update -o APT::Update::Timeout="120" && \
     apt-get install -y --fix-missing --no-install-recommends \
     # Tesseract engine and language packs (English, Japanese, Bengali)
@@ -37,7 +38,12 @@ RUN apt-get clean && apt-get update -o APT::Update::Timeout="120" && \
 # Step 2: Copy requirements file and install Python packages
 # This step MUST come AFTER system packages are installed.
 COPY api_files/requirements.txt .
+
+# Install core dependencies first
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install media packages separately to avoid ModuleNotFoundError for moviepy.editor
+RUN pip install --no-cache-dir moviepy imageio-ffmpeg
 
 # Expose the port the app runs on
 EXPOSE 8000

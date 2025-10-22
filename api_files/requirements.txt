@@ -26,6 +26,4 @@ pydantic
 pytesseract
 python-multipart
 pydantic[email]
-moviepy
-imageio-ffmpeg
 SQLAlchemy
