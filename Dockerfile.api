@@ -7,9 +7,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Step 1: Install ALL System-level Dependencies (Tesseract, Poppler, Image libs, Magic libs)
+# ffmpeg is crucial here for moviepy
 RUN apt-get clean && apt-get update -o APT::Update::Timeout="120" && \
     apt-get install -y --fix-missing --no-install-recommends \
-    # Tesseract engine and language packs (English, Japanese, Bengali)
+    # Tesseract engine and language packs
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-jpn \
@@ -35,15 +36,12 @@ RUN apt-get clean && apt-get update -o APT::Update::Timeout="120" && \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Step 2: Copy requirements file and install Python packages
-# This step MUST come AFTER system packages are installed.
-COPY api_files/requirements.txt .
-
-# Install core dependencies first
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install media packages separately to avoid ModuleNotFoundError for moviepy.editor
+# Step 2: Install media dependencies FIRST for stability. <--- NEW STEP
 RUN pip install --no-cache-dir moviepy imageio-ffmpeg
+
+# Step 3: Install core Python packages
+COPY api_files/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Expose the port the app runs on
 EXPOSE 8000
