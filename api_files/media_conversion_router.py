@@ -123,7 +123,10 @@ class ImageToWebPRequest(BaseModel):
 
 # --- S3 Helper Functions ---
 def upload_to_s3(
-    file_data: bytes, filename: str, content_type: str, folder: str = "converted"
+    file_data: bytes,
+    filename: str,
+    content_type: str,
+    folder: str = "convert-it/converted",
 ) -> Optional[str]:
     """
     Upload file to S3 and return the public URL.
@@ -241,7 +244,7 @@ async def convert_to_mp3_from_file(
                 file_data=mp3_data,
                 filename=output_filename,
                 content_type="audio/mpeg",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -312,7 +315,7 @@ async def convert_to_mp3_from_base64(
                 file_data=mp3_data,
                 filename=output_filename,
                 content_type="audio/mpeg",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -397,7 +400,7 @@ async def compress_video_from_file(
                 file_data=compressed_data,
                 filename=output_filename,
                 content_type="video/mp4",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -477,7 +480,7 @@ async def compress_video_from_base64(
                 file_data=compressed_data,
                 filename=output_filename,
                 content_type="video/mp4",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -589,7 +592,7 @@ async def convert_to_webp_from_file(
                 file_data=webp_data,
                 filename=output_filename,
                 content_type="image/webp",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -657,7 +660,7 @@ async def convert_to_webp_from_base64(
                 file_data=webp_data,
                 filename=output_filename,
                 content_type="image/webp",
-                folder="converted",
+                folder="convert-it/converted",
             )
 
             if download_url:
@@ -727,7 +730,7 @@ async def conversion_status():
         "status": "operational",
         "s3_enabled": s3_client is not None,
         "s3_bucket": S3_BUCKET if s3_client else None,
-        "s3_folder": "converted/",
+        "s3_folder": "convert-it/converted/",
         "note": "All converted files (mp3, webp, mp4) are stored in the same folder",
         "converters": {
             "audio": "operational",
@@ -735,9 +738,9 @@ async def conversion_status():
             "image": "operational",
         },
         "endpoints": {
-            "audio_conversion": "/convert/mp3/*",
-            "video_compression": "/convert/compress-video/*",
-            "image_conversion": "/convert/webp/*",
-            "media_info": "/convert/*-info/*",
+            "audio_conversion": "/converted/*",
+            "video_compression": "/converted/*",
+            "image_conversion": "/converted/*",
+            "media_info": "/converted/*",
         },
     }
