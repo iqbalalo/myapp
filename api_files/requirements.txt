@@ -3,6 +3,7 @@ numpy
 matplotlib
 seaborn
 boto3
+botocore
 requests
 openpyxl
 xlsxwriter
@@ -28,4 +29,7 @@ python-multipart
 pydantic[email]
 moviepy
 imageio-ffmpeg
+imageio
 SQLAlchemy
+pydantic_core
+reportlab
