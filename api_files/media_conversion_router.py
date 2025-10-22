@@ -35,6 +35,7 @@ from botocore.exceptions import ClientError
 # Import converter modules
 from media_converter_api import MediaConverterAPI
 from image_to_webp_api import ImageToWebPAPI
+from typing import Optional, List  # Add List here
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -337,6 +338,102 @@ async def convert_to_mp3_from_base64(
         logger.error(f"Error during MP3 conversion from base64: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to convert to MP3: {str(e)}"
+        )
+
+
+@router.post("/mp3/batch/")
+async def convert_multiple_to_mp3(
+    fastapi_request: Request,
+    files: List[UploadFile] = File(..., description="Multiple audio/video files"),
+    bitrate: str = Form("192k", description="Audio bitrate for all files"),
+    use_s3: bool = Form(False, description="Upload all to S3"),
+    return_base64: bool = Form(
+        False, description="Include base64 (not recommended for multiple files)"
+    ),
+    _: str = Depends(verify_api_key_for_conversions),
+) -> JSONResponse:
+    """
+    Convert multiple audio/video files to MP3 format.
+    Max 10 files per request.
+    """
+    try:
+        if len(files) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 files per request")
+
+        valid_bitrates = ["128k", "192k", "256k", "320k"]
+        if bitrate not in valid_bitrates:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid bitrate. Must be one of: {', '.join(valid_bitrates)}",
+            )
+
+        results = []
+
+        for file in files:
+            try:
+                file_data = await file.read()
+                filename = file.filename or "audio.mp3"
+
+                result = await asyncio.get_event_loop().run_in_executor(
+                    PROCESS_EXECUTOR,
+                    media_converter.convert_to_mp3,
+                    file_data,
+                    filename,
+                    bitrate,
+                )
+
+                mp3_data, output_filename = result
+
+                file_result = {
+                    "success": True,
+                    "original_filename": filename,
+                    "output_filename": output_filename,
+                    "bitrate": bitrate,
+                    "output_size_mb": round(len(mp3_data) / (1024 * 1024), 2),
+                }
+
+                if use_s3:
+                    download_url = upload_to_s3(
+                        file_data=mp3_data,
+                        filename=output_filename,
+                        content_type="audio/mpeg",
+                        folder="convert-it/converted",
+                    )
+
+                    if download_url:
+                        file_result["download_url"] = download_url
+                        file_result["expires_at"] = (
+                            datetime.now() + timedelta(days=30)
+                        ).isoformat()
+                    else:
+                        file_result["s3_upload_error"] = "Failed to upload to S3"
+
+                if return_base64:
+                    file_result["file_base64"] = base64.b64encode(mp3_data).decode(
+                        "utf-8"
+                    )
+
+                results.append(file_result)
+
+            except Exception as e:
+                results.append(
+                    {
+                        "success": False,
+                        "original_filename": file.filename,
+                        "error": str(e),
+                    }
+                )
+
+        return JSONResponse(
+            content={"success": True, "total_files": len(files), "results": results}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during batch MP3 conversion: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert files: {str(e)}"
         )
 
 
