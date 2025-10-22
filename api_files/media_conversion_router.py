@@ -47,7 +47,7 @@ PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 # S3 Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "www.aloraloy.com")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_REGION = os.getenv("S3_REGION", "ap-northeast-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
@@ -139,7 +139,7 @@ def upload_to_s3(
         folder: S3 folder path (default: converted)
 
     Returns:
-        Public URL: https://www.aloraloy.com/converted/20251022_143052_video.mp3
+        Public URL: https://www.aloraloy.com/convert-it/converted/20251022_143052_video.mp3
     """
     if not s3_client:
         logger.error("S3 client not initialized")
