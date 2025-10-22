@@ -157,7 +157,7 @@ def upload_to_s3(
             Key=s3_key,
             Body=file_data,
             ContentType=content_type,
-            ACL="public-read",
+            # ACL="public-read",
         )
 
         # Generate direct URL
