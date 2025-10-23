@@ -152,13 +152,13 @@ def upload_to_s3(
         unique_filename = f"{timestamp}_{filename}"
         s3_key = f"{folder}/{unique_filename}"
 
-        # Upload to S3 with public ACL
+        # Upload to S3 with public ACL and Content-Disposition header for download
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=s3_key,
             Body=file_data,
             ContentType=content_type,
-            # ACL="public-read",
+            ContentDisposition=f'attachment; filename="{filename}"',
         )
 
         # Generate direct URL
