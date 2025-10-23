@@ -60,7 +60,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://www.aloraloy.com",
         "https://aloraloy.com",
-        "http://52.196.69.248",
+        "https://myapi.suslab-data.com",
         "*",
     ],
     allow_credentials=True,
