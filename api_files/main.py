@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import core processor logic
 from pdf_processor import PDFProcessor, create_file_hash
@@ -53,6 +54,19 @@ app = FastAPI(
 )
 app.include_router(media_conversion_router)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://www.aloraloy.com",
+        "https://aloraloy.com",
+        "http://52.196.69.248",
+        "*",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Supported image MIME types
 SUPPORTED_IMAGE_TYPES = {
