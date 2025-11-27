@@ -8,6 +8,7 @@ from fastapi import (
     Header,
     Depends,
     Request,
+    APIRouter,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
@@ -33,7 +34,6 @@ from media_conversion_router import router as media_conversion_router
 
 # Import database CRUD router
 from db_router import router as db_router
-
 
 # Configuration
 PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
@@ -100,17 +100,23 @@ class Base64FileRequest(BaseModel):
     file_base64: str
     use_ocr: Optional[bool] = True
     ocr_language: Optional[str] = "eng+jpn"
+    filename: Optional[str] = None  # Add optional filename
 
 
 class Base64ImageRequest(BaseModel):
     file_base64: str
     ocr_language: Optional[str] = "eng+jpn"
+    filename: Optional[str] = None  # Add optional filename
 
 
 class PDFSplitRequest(BaseModel):
     file_base64: str
     pages_per_split: int
     original_filename: Optional[str] = "document"
+
+
+class PDFAnalysisRequest(BaseModel):
+    file_base64: str
 
 
 class CreateAPIKeyRequest(BaseModel):
@@ -123,7 +129,6 @@ class DeleteAPIKeyRequest(BaseModel):
 
 
 # --- API Key Management Functions ---
-# (Keep all existing API key management functions from the original file)
 
 
 def _get_db_connection():
@@ -262,14 +267,14 @@ def verify_api_key(request: Request, x_api_key: str = Header(..., alias="X-API-K
     """Verifies the API key from request headers."""
     default_key = _get_default_api_key()
     api_keys = _load_api_keys()
-    
+
     client_ip = _get_client_ip(request)
-    
+
     # Check default key
     if x_api_key == default_key:
         _log_api_usage(x_api_key, request.url.path, client_ip)
         return x_api_key
-    
+
     # Check stored keys
     if x_api_key in api_keys:
         key_info = api_keys[x_api_key]
@@ -277,18 +282,17 @@ def verify_api_key(request: Request, x_api_key: str = Header(..., alias="X-API-K
             expires = datetime.fromisoformat(key_info["expires"])
             if datetime.now() > expires:
                 raise HTTPException(status_code=401, detail="API key has expired")
-        
+
         _log_api_usage(x_api_key, request.url.path, client_ip)
         return x_api_key
-    
+
     raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# Keep all existing endpoints from main.py
-# ... (all the PDF, OCR, image processing endpoints remain the same)
+# --- ROOT ENDPOINT ---
 
 
-@app.get("/")
+@app.get("/", tags=["Root"])
 async def root():
     """Root endpoint with API information."""
     return JSONResponse(
@@ -336,7 +340,535 @@ async def root():
     )
 
 
-# Initialize database tables on startup
+# --- API KEY MANAGEMENT ENDPOINTS ---
+
+
+@app.post("/api-keys/create/", tags=["API Key Management"])
+async def create_api_key(
+    request: CreateAPIKeyRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Creates a new API key (requires master key).
+    
+    Expires format: "never", "30d", "90d", "1y", or ISO datetime string.
+    """
+    # Verify master key
+    if api_key != _get_default_api_key():
+        raise HTTPException(
+            status_code=403, detail="Only master key can create new API keys"
+        )
+
+    # Parse expiration
+    expires = None
+    if request.expires.lower() != "never":
+        if request.expires.endswith("d"):
+            days = int(request.expires[:-1])
+            expires = datetime.now() + timedelta(days=days)
+        elif request.expires.endswith("y"):
+            years = int(request.expires[:-1])
+            expires = datetime.now() + timedelta(days=years * 365)
+        else:
+            try:
+                expires = datetime.fromisoformat(request.expires)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid expiration format"
+                )
+
+    # Generate new API key
+    new_key = secrets.token_urlsafe(32)
+
+    # Save to database
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(
+                status_code=500, detail="Database connection failed"
+            )
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO api.api_keys (api_key, email, expires)
+            VALUES (%s, %s, %s);
+        """,
+            (new_key, request.email, expires),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return JSONResponse(
+            content={
+                "api_key": new_key,
+                "email": request.email,
+                "expires": expires.isoformat() if expires else "Never",
+                "created_at": datetime.now().isoformat(),
+            }
+        )
+    except Exception as e:
+        logging.error(f"Failed to create API key: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create API key: {str(e)}"
+        )
+
+
+@app.get("/api-keys/list/", tags=["API Key Management"])
+async def list_api_keys(api_key: str = Depends(verify_api_key)):
+    """Lists all API keys (requires master key)."""
+    if api_key != _get_default_api_key():
+        raise HTTPException(
+            status_code=403, detail="Only master key can list API keys"
+        )
+
+    api_keys = _load_api_keys()
+    return JSONResponse(content={"api_keys": api_keys, "count": len(api_keys)})
+
+
+@app.delete("/api-keys/delete/", tags=["API Key Management"])
+async def delete_api_key(
+    request: DeleteAPIKeyRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """Deletes an API key (requires master key)."""
+    if api_key != _get_default_api_key():
+        raise HTTPException(
+            status_code=403, detail="Only master key can delete API keys"
+        )
+
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(
+                status_code=500, detail="Database connection failed"
+            )
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM api.api_keys WHERE api_key = %s;", (request.api_key,)
+        )
+        deleted_count = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail="API key not found")
+
+        return JSONResponse(
+            content={
+                "message": "API key deleted successfully",
+                "deleted_key": request.api_key,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to delete API key: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete API key: {str(e)}"
+        )
+
+
+@app.get("/api-keys/usage/", tags=["API Key Management"])
+async def get_usage_stats(
+    api_key: str = Depends(verify_api_key),
+    days: int = 30,
+    limit: int = 100,
+):
+    """
+    Gets API usage statistics (requires master key).
+    
+    Query parameters:
+    - days: Number of days to look back (default: 30)
+    - limit: Maximum number of records to return (default: 100)
+    """
+    if api_key != _get_default_api_key():
+        raise HTTPException(
+            status_code=403, detail="Only master key can view usage stats"
+        )
+
+    try:
+        conn = _get_db_connection()
+        if not conn:
+            raise HTTPException(
+                status_code=500, detail="Database connection failed"
+            )
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Get usage records
+        cursor.execute(
+            """
+            SELECT email, api_key, api_endpoint, used, ip
+            FROM api.api_key_usage
+            WHERE used >= NOW() - INTERVAL '%s days'
+            ORDER BY used DESC
+            LIMIT %s;
+        """,
+            (days, limit),
+        )
+        usage_records = cursor.fetchall()
+
+        # Get summary by email
+        cursor.execute(
+            """
+            SELECT email, COUNT(*) as request_count
+            FROM api.api_key_usage
+            WHERE used >= NOW() - INTERVAL '%s days'
+            GROUP BY email
+            ORDER BY request_count DESC;
+        """,
+            (days,),
+        )
+        summary = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return JSONResponse(
+            content={
+                "period_days": days,
+                "total_requests": len(usage_records),
+                "summary_by_email": [dict(row) for row in summary],
+                "recent_usage": [
+                    {
+                        "email": row["email"],
+                        "api_endpoint": row["api_endpoint"],
+                        "used": row["used"].isoformat() if row["used"] else None,
+                        "ip": row["ip"],
+                    }
+                    for row in usage_records
+                ],
+            }
+        )
+    except Exception as e:
+        logging.error(f"Failed to get usage stats: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get usage stats: {str(e)}"
+        )
+
+
+# --- PDF/IMAGE EXTRACTION ENDPOINTS ---
+
+
+@app.post("/extract/file/", tags=["Text Extraction"])
+async def extract_from_file(
+    request: Request,
+    file: UploadFile = File(...),
+    use_ocr: bool = Form(True),
+    ocr_language: str = Form("eng+jpn"),
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Extracts text from uploaded PDF or image file.
+    
+    Supports: PDF, JPEG, PNG, TIFF, BMP, GIF, WEBP
+    """
+    try:
+        file_data = await file.read()
+        filename = file.filename or "unknown"
+        content_type = file.content_type
+
+        # Process based on file type
+        if content_type == "application/pdf":
+            result = await asyncio.get_event_loop().run_in_executor(
+                PROCESS_EXECUTOR,
+                pdf_processor.extract_text,
+                file_data,
+                use_ocr,
+                ocr_language,
+            )
+        elif content_type in SUPPORTED_IMAGE_TYPES:
+            result = await asyncio.get_event_loop().run_in_executor(
+                PROCESS_EXECUTOR,
+                image_processor.extract_text,
+                file_data,
+                ocr_language,
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {content_type}. Supported: PDF, JPEG, PNG, TIFF, BMP, GIF, WEBP",
+            )
+
+        # Add filename to response
+        result["filename"] = filename
+        
+        # Prepend filename to file_text
+        if result.get("file_text"):
+            result["file_text"] = f"Filename: {filename}\n{result['file_text']}"
+
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+
+
+@app.post("/extract/base64/", tags=["Text Extraction"])
+async def extract_from_base64(
+    request: Base64FileRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Extracts text from base64-encoded PDF file.
+    
+    Request body:
+    {
+        "file_base64": "base64_encoded_pdf_data",
+        "use_ocr": true,
+        "ocr_language": "eng+jpn",
+        "filename": "optional_filename.pdf"
+    }
+    """
+    try:
+        file_data = base64.b64decode(request.file_base64)
+        filename = request.filename or "document.pdf"
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            pdf_processor.extract_text,
+            file_data,
+            request.use_ocr,
+            request.ocr_language,
+        )
+
+        # Add filename to response
+        result["filename"] = filename
+        
+        # Prepend filename to file_text
+        if result.get("file_text"):
+            result["file_text"] = f"Filename: {filename}\n{result['file_text']}"
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        logging.error(f"Base64 extraction failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Base64 extraction failed: {str(e)}"
+        )
+
+
+@app.post("/extract/image/base64/", tags=["Text Extraction"])
+async def extract_from_image_base64(
+    request: Base64ImageRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Extracts text from base64-encoded image file using OCR.
+    
+    Supports: JPEG, PNG, TIFF, BMP, GIF, WEBP
+    
+    Request body:
+    {
+        "file_base64": "base64_encoded_image_data",
+        "ocr_language": "eng+jpn",
+        "filename": "optional_filename.jpg"
+    }
+    """
+    try:
+        file_data = base64.b64decode(request.file_base64)
+        filename = request.filename or "image"
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            image_processor.extract_text,
+            file_data,
+            request.ocr_language,
+        )
+
+        # Add filename to response
+        result["filename"] = filename
+        
+        # Prepend filename to file_text
+        if result.get("file_text"):
+            result["file_text"] = f"Filename: {filename}\n{result['file_text']}"
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        logging.error(f"Image extraction failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Image extraction failed: {str(e)}"
+        )
+
+
+@app.get("/tesseract/languages/", tags=["Text Extraction"])
+async def get_tesseract_languages(api_key: str = Depends(verify_api_key)):
+    """
+    Returns available Tesseract OCR languages.
+    
+    Common language codes:
+    - eng: English
+    - jpn: Japanese
+    - chi_sim: Chinese Simplified
+    - chi_tra: Chinese Traditional
+    - kor: Korean
+    - ara: Arabic
+    - fra: French
+    - deu: German
+    - spa: Spanish
+    - rus: Russian
+    - ben: Bengali
+    - hin: Hindi
+    
+    Use "+" to combine languages (e.g., "eng+jpn")
+    """
+    try:
+        import pytesseract
+
+        languages = pytesseract.get_languages(config="")
+        return JSONResponse(
+            content={
+                "available_languages": languages,
+                "example_usage": "eng+jpn (for English and Japanese)",
+            }
+        )
+    except Exception as e:
+        logging.error(f"Failed to get languages: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get languages: {str(e)}"
+        )
+
+
+# --- PDF SPLITTING ENDPOINTS ---
+
+
+@app.post("/split/file/", tags=["PDF Operations"])
+async def split_pdf_file(
+    file: UploadFile = File(...),
+    pages_per_split: int = Form(...),
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Splits uploaded PDF into multiple files.
+    
+    Returns JSON with base64-encoded split files.
+    """
+    try:
+        if file.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400, detail="Only PDF files are supported"
+            )
+
+        file_data = await file.read()
+        original_filename = file.filename or "document"
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            pdf_splitter.split_pdf,
+            file_data,
+            pages_per_split,
+            original_filename,
+        )
+
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"PDF split failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF split failed: {str(e)}")
+
+
+@app.post("/split/base64/", tags=["PDF Operations"])
+async def split_pdf_base64(
+    request: PDFSplitRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Splits base64-encoded PDF into multiple files.
+    
+    Returns JSON with base64-encoded split files.
+    """
+    try:
+        file_data = base64.b64decode(request.file_base64)
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            pdf_splitter.split_pdf,
+            file_data,
+            request.pages_per_split,
+            request.original_filename,
+        )
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        logging.error(f"PDF split failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF split failed: {str(e)}")
+
+
+# --- PDF ANALYSIS ENDPOINTS ---
+
+
+@app.post("/analyze/file/", tags=["PDF Operations"])
+async def analyze_pdf_file(
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Analyzes PDF to identify image-based pages (fast, no OCR).
+    
+    Returns page analysis without extracting text.
+    """
+    try:
+        if file.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400, detail="Only PDF files are supported"
+            )
+
+        file_data = await file.read()
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            pdf_processor.analyze_pages,
+            file_data,
+        )
+
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"PDF analysis failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"PDF analysis failed: {str(e)}"
+        )
+
+
+@app.post("/analyze/base64/", tags=["PDF Operations"])
+async def analyze_pdf_base64(
+    request: PDFAnalysisRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Analyzes base64-encoded PDF to identify image-based pages.
+    
+    Returns page analysis without extracting text.
+    """
+    try:
+        file_data = base64.b64decode(request.file_base64)
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            PROCESS_EXECUTOR,
+            pdf_processor.analyze_pages,
+            file_data,
+        )
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        logging.error(f"PDF analysis failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"PDF analysis failed: {str(e)}"
+        )
+
+
+# --- STARTUP EVENT ---
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database tables on application startup."""
@@ -347,4 +879,5 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
